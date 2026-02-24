@@ -1,0 +1,16 @@
+# @package _global_
+module:
+  _target_: emg2qwerty.lightning.CNNCTCModule
+  in_features: 528  # freq * channels = (n_fft // 2 + 1) * 16
+  mlp_features: [384]
+  hidden_channels: [64, 128, 256, 512, 512]
+  convs_per_block: [2, 2, 3, 3, 3]
+  kernel_size: 5
+  dropout2d: 0.2
+  fc_hidden_channels: [512, 128]
+  fc_dropout: 0.2
+
+datamodule:
+  _target_: emg2qwerty.lightning.WindowedEMGDataModule
+  window_length: 8000  
+  padding: [0, 0]  

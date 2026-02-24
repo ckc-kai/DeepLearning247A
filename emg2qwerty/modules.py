@@ -8,7 +8,9 @@ from collections.abc import Sequence
 
 import torch
 from torch import nn
-
+import logging
+from typing import List, Optional
+logger = logging.getLogger(__name__)
 
 class SpectrogramNorm(nn.Module):
     """A `torch.nn.Module` that applies 2D batch normalization over spectrogram
@@ -278,3 +280,158 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+class ConvBlock(nn.Module):
+    def __init__(
+        self, 
+        in_channels, 
+        out_channels, 
+        kernel_size, 
+        stride,
+        norm,
+        activation,
+        dropout1d):
+        super().__init__()
+
+        # default padding ensures T dimension does not shrink if stride=1
+        padding = kernel_size // 2
+
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding, stride=stride)
+        self.norm = self.make_norm(norm, out_channels)
+        self.activation = self.make_activation(activation)
+        self.dropout = nn.Dropout1d(dropout1d) if dropout1d and dropout1d > 0 else nn.Identity()
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        return x
+    def make_norm(self, norm, out_channels):
+        if norm == "batchnorm":
+            return nn.BatchNorm1d(out_channels)
+        elif norm == "layernorm":
+            return nn.GroupNorm(1, out_channels)
+        elif norm == "groupnorm":
+            return nn.GroupNorm(min(32, out_channels), out_channels)
+        else:
+            logger.warning(f"Unknown norm type: {norm}. Do nothing.")
+            return nn.Identity()
+    def make_activation(self, activation):
+        if activation == "relu":
+            return nn.ReLU(inplace=True)
+        elif activation == "gelu":
+            return nn.GELU()
+        elif activation == "silu":
+            return nn.SiLU(inplace=True)
+        else:
+            logger.warning(f"Unknown activation type: {activation}. Use ReLU instead.")
+            return nn.ReLU(inplace=True)
+
+class BatchNorm1dPermute(nn.Module):
+    """
+    Standard PyTorch BatchNorm1d expects (Batch, Channels, Time) but our sequence tensor
+    features in the Fully Connected head are passed as (Time, Batch, Channels).
+    This wrapper performs the dimensions swap automatically.
+    """
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.bn = nn.BatchNorm1d(channels)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x expected as (T, N, C)
+        x = x.permute(1, 2, 0) # (T, N, C) -> (N, C, T)
+        x = self.bn(x)
+        return x.permute(2, 0, 1) # (N, C, T) -> (T, N, C)
+
+class CNNCustome(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        channels: Sequence[int] = (64, 64, 128, 128, 256), 
+        convs_per_block: Sequence[int] = (2, 2, 3, 3, 3),   
+        kernel_size: int = 3,
+        norm: Optional[str] = "batchnorm",
+        activation: str = "relu",
+        dropout2d: float = 0.0,
+        fc_dims: Sequence[int] = (512, 256), 
+        fc_dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert len(channels) == len(convs_per_block), "channels and convs_per_block must have the same length"
+
+        self.features = nn.Sequential()
+        prev = in_channels
+
+        for index, (out_f, convs) in enumerate(zip(channels, convs_per_block)):
+            layers: List[nn.Module] = []
+            for _ in range(convs):
+                layers.append(
+                    ConvBlock(
+                        in_channels= prev,
+                        out_channels= out_f,
+                        kernel_size=kernel_size,
+                        stride=1,
+                        norm=norm,
+                        activation=activation,
+                        dropout1d=dropout2d
+                    )
+                )
+                prev = out_f
+            
+            # Downsample temporally by 2 after each block of convolutions
+            layers.append(nn.MaxPool1d(kernel_size=2, stride=2))
+            
+            self.features.add_module(f"block{index}", nn.Sequential(*layers))
+    
+        head: List[nn.Module] = []
+        for i, dim in enumerate(fc_dims):
+            head.append(nn.Linear(prev, dim))
+            head.append(self.make_norm_1d(norm, dim))
+            head.append(self.make_activation(activation))
+            head.append(nn.Dropout(fc_dropout))
+            prev = dim
+
+        self.head = nn.Sequential(*head)
+        self.output_size = prev
+
+    def forward(self, x):
+        # x is (Time, Batch, Channels)
+        # 1. Permute to (Batch, Channels, Time) for Conv1d
+        x = x.permute(1, 2, 0)
+        
+        # 2. Pass through CNN layers
+        x = self.features(x)
+        
+        # 3. Permute back to (Time, Batch, Channels) for Linear layers and CTC Loss
+        x = x.permute(2, 0, 1)
+        
+        # 4. Apply the fully connected head over the channels dimension
+        x = self.head(x)
+        return x
+
+    def make_norm_1d(self, norm, out_channels):
+        if norm == "batchnorm":
+            return BatchNorm1dPermute(out_channels)
+        elif norm == "layernorm":
+            return nn.LayerNorm(out_channels)
+        elif norm == "groupnorm":
+            return nn.GroupNorm(min(32, out_channels), out_channels)
+        else:
+            logger.warning(f"Unknown norm type: {norm}. Do nothing.")
+            return nn.Identity()
+
+    def make_activation(self, activation):
+        if activation == "relu":
+            return nn.ReLU(inplace=True)
+        elif activation == "gelu":
+            return nn.GELU()
+        elif activation == "silu":
+            return nn.SiLU(inplace=True)
+        else:
+            logger.warning(f"Unknown activation type: {activation}. Use ReLU instead.")
+            return nn.ReLU(inplace=True)
+    
+            
+        
+        
