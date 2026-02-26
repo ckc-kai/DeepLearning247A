@@ -1,0 +1,37 @@
+# @package _global_
+module:
+  _target_: emg2qwerty.lightning.CyRo2FormersCTCModule
+  in_features: 528          # freq(33) * channels(16)
+  mlp_features: [384]
+
+  # --- Electrode Mixer ---
+  electrode_mixer_heads: 4
+  electrode_mixer_dim: 384
+  use_cyrope: true
+
+  # --- Backbone ---
+  backbone_d_model: 768         # 2 bands * 384
+  backbone_n_layers: 2       
+  transformer_n_heads: 8
+  transformer_dim_feedforward: 1024 
+  transformer_dropout: 0.15     
+
+  # --- Attention Refinement ---
+  use_attention_head: true
+  attn_n_layers: 2
+  attn_n_heads: 8
+  attn_dim_feedforward: 1024
+  attn_dropout: 0.1
+
+  # --- Spectral Branch ---
+  use_spectral_branch: true    # Enabled for ablation study
+  spectral_conv_channels: [128, 256, 256]
+  spectral_kernel_size: 5
+
+  # --- Fusion ---
+  fusion_type: "gated"       # "gated", "concat", "add"
+
+datamodule:
+  _target_: emg2qwerty.lightning.WindowedEMGDataModule
+  window_length: 8000        # 4 sec windows for 2kHz EMG
+  padding: [1800, 200]       # 900ms past context, 100ms future context

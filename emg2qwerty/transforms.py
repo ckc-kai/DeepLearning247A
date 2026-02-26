@@ -243,3 +243,15 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+@dataclass
+class DualBranchTransform:
+    """Clones the tensor for raw output, and applies spectral transforms for spectral output.
+    Returns a dictionary of {"raw": raw, "spectral": spectral}."""
+    spectral_transforms: Transform[torch.Tensor, torch.Tensor]
+
+    def __call__(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {
+            "raw": tensor.clone(),
+            "spectral": self.spectral_transforms(tensor)
+        }

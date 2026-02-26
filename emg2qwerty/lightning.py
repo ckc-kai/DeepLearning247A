@@ -4,9 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from emg2qwerty.modules import CNNCustome
 from collections.abc import Sequence
 from pathlib import Path
+import math
 from typing import Any, ClassVar
 
 import numpy as np
@@ -26,7 +26,9 @@ from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
     SpectrogramNorm,
     TDSConvEncoder,
-    CNNCustome
+    CNNCustome,
+    MultiBandElectrodeMixer,
+    CyRo2FormersEncoder,
 )
 from emg2qwerty.transforms import Transform
 
@@ -93,8 +95,10 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                     transform=self.test_transform,
                     # Feed the entire session at once without windowing/padding
                     # at test time for more realism
-                    window_length=None,
-                    padding=(0, 0),
+                    # window_length=None,
+                    # padding=(0, 0),
+                    window_length=self.window_length,
+                    padding=self.padding,
                     jitter=False,
                 )
                 for hdf5_path in self.test_sessions
@@ -128,9 +132,12 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         # fed at once. Limit batch size to 1 to fit within GPU memory and
         # avoid any influence of padding (while collating multiple batch items)
         # in test scores.
+        # However, due to the window size limitation, we cannot feed the entire
+        # session at once. Instead, we feed the session in chunks of
+        # window_length.
         return DataLoader(
             self.test_dataset,
-            batch_size=1,
+            batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
@@ -413,3 +420,216 @@ class CNNCTCModule(pl.LightningModule):
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
+
+
+class CyRo2FormersCTCModule(pl.LightningModule):
+    """Lightning module for the CyRo2Formers architecture.
+
+    Supports dual-input (spectral + optional raw EMG) and toggleable
+    components via YAML config for ablation studies.
+    """
+
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        # Electrode mixer
+        electrode_mixer_heads: int = 4,
+        electrode_mixer_dim: int = 384,
+        use_cyrope: bool = True,
+        # Backbone
+        backbone_d_model: int = 768,
+        backbone_n_layers: int = 4,
+        transformer_n_heads: int = 8,
+        transformer_dim_feedforward: int = 2048,
+        transformer_dropout: float = 0.1,
+        # Attention refinement
+        use_attention_head: bool = True,
+        attn_n_layers: int = 2,
+        attn_n_heads: int = 8,
+        attn_dim_feedforward: int = 1024,
+        attn_dropout: float = 0.1,
+        # Spectral branch
+        use_spectral_branch: bool = True,
+        spectral_conv_channels: Sequence[int] = (128, 256, 256),
+        spectral_kernel_size: int = 5,
+        fusion_type: str = "gated",
+        # Training
+        optimizer: DictConfig = None,
+        lr_scheduler: DictConfig = None,
+        decoder: DictConfig = None,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+        #self.use_spectral_branch = use_spectral_branch
+
+        # Derive freq_bins from in_features / electrode_channels
+        freq_bins = in_features // self.ELECTRODE_CHANNELS  # 528 // 16 = 33
+
+        self.spec_norm = SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS)
+        
+        # Branch 1: Local rotation-invariant dense features (uses flattened C x freq)
+        self.mlp_extractor = MultiBandRotationInvariantMLP(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            num_bands=self.NUM_BANDS,
+        )
+        
+        # Branch 2: Global self-attention across electrodes (uses raw C, freq)
+        self.attention_mixer = MultiBandElectrodeMixer(
+            in_features=freq_bins,
+            d_model=electrode_mixer_dim,
+            n_heads=electrode_mixer_heads,
+            n_electrodes=self.ELECTRODE_CHANNELS,
+            use_cyrope=use_cyrope,
+            num_bands=self.NUM_BANDS,
+        )
+        
+        # Combine features from both branches: 
+        # (T, N, bands, mlp_dim) and (T, N, bands, attn_dim) -> (T, N, bands, mlp_dim + attn_dim)
+        mlp_dim = mlp_features[-1]
+        combined_dim = self.NUM_BANDS * (mlp_dim + electrode_mixer_dim)
+        self.frontend_proj = nn.Linear(combined_dim, backbone_d_model) if combined_dim != backbone_d_model else nn.Identity()
+
+        # Build the CyRo2Formers core encoder
+        self.encoder = CyRo2FormersEncoder(
+            backbone_d_model=backbone_d_model,
+            backbone_n_layers=backbone_n_layers,
+            transformer_n_heads=transformer_n_heads,
+            transformer_dim_feedforward=transformer_dim_feedforward,
+            transformer_dropout=transformer_dropout,
+            use_attention_head=use_attention_head,
+            attn_n_layers=attn_n_layers,
+            attn_n_heads=attn_n_heads,
+            attn_dim_feedforward=attn_dim_feedforward,
+            attn_dropout=attn_dropout,
+            use_cyrope=use_cyrope,
+            use_spectral_branch=use_spectral_branch,
+            spectral_conv_channels=spectral_conv_channels,
+            spectral_kernel_size=spectral_kernel_size,
+            fusion_type=fusion_type,
+            num_bands=self.NUM_BANDS,
+            n_electrodes=self.ELECTRODE_CHANNELS,
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(backbone_d_model, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+        # Criterion
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class, zero_infinity=True)
+
+        # Decoder
+        self.decoder = instantiate(decoder)
+
+        # Metrics
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
+        )
+
+    def forward(
+        self,
+        spectral_input: torch.Tensor,
+        raw_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # 1. Normalize spectrograms
+        x_norm = self.spec_norm(spectral_input)
+        
+        # 2. Extract parallel features
+        x_mlp = self.mlp_extractor(x_norm)    # (T, N, bands, mlp_dim)
+        x_attn = self.attention_mixer(x_norm) # (T, N, bands, attn_dim)
+        
+        # 3. Concatenate and project to backbone_d_model
+        x_combined = torch.cat([x_mlp, x_attn], dim=-1) # (T, N, bands, mlp + attn)
+        x_combined = x_combined.flatten(start_dim=2)    # (T, N, bands * (mlp + attn))
+        x_proj = self.frontend_proj(x_combined)         # (T, N, backbone_d_model)
+        
+        # 4. Sequence Modeling & Classification
+        x_enc = self.encoder(x_proj, raw_input)
+        return self.classifier(x_enc)
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)
+
+        # Get optional raw input
+        raw_input = batch.get("raw_inputs", None)
+
+        emissions = self.forward(inputs, raw_input)
+
+        # The model does not downsample temporally (Transformer preserves T),
+        # but spectrogram hop already reduced T. Compute emission lengths
+        # using ratio in case any component introduces slight T changes.
+        T_in = inputs.shape[0]
+        T_out = emissions.shape[0]
+        emission_lengths = torch.div(
+            input_lengths * T_out, T_in, rounding_mode="floor"
+        )
+
+        loss = self.ctc_loss(
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
+        )
+
+        # Decode emissions
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        # Update metrics
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+

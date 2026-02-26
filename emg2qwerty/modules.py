@@ -5,8 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Sequence
+import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 import logging
 from typing import List, Optional
@@ -431,7 +433,649 @@ class CNNCustome(nn.Module):
         else:
             logger.warning(f"Unknown activation type: {activation}. Use ReLU instead.")
             return nn.ReLU(inplace=True)
-    
+
+
+class CyRoPE(nn.Module):
+    """Cylindrical Rotary Positional Embedding for 2D grids (time × electrode).
+
+    For the **electrode axis** the positions wrap around (circular / cylindrical),
+    matching the physical ring of 16 electrodes on the wrist band.
+    For the **time axis** positions are linear (standard RoPE frequencies).
+
+    The embedding is returned as (cos, sin) pairs that can be used to rotate
+    Q/K vectors in an attention layer.
+
+    Args:
+        d_model (int): Model dimensionality (must be divisible by 4 to split
+            across two 2-D axes, each needing pairs).
+        n_electrodes (int): Number of electrode positions (default: 16).
+        max_time (int): Maximum temporal length to pre-compute (default: 2048).
+        base_freq (float): Base for geometric frequency progression (default: 10000).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_electrodes: int = 16,
+        max_time: int = 2048,
+        base_freq: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        assert d_model % 4 == 0, "d_model must be divisible by 4 for 2-D RoPE"
+        self.base_freq = base_freq
+        
+        half = d_model // 2  # dims per axis
+        quarter = half // 2  # pairs per axis
+
+        # Frequency bands for time axis (standard RoPE)
+        freq_time = 1.0 / (
+            base_freq ** (torch.arange(0, quarter, dtype=torch.float32) / quarter)
+        )
+        # Frequency bands for electrode axis (cylindrical – 2π period)
+        freq_elec = 2.0 * math.pi * torch.arange(1, quarter + 1, dtype=torch.float32)
+
+        # Pre-compute time positions [max_time] × freqs → [max_time, quarter]
+        t_pos = torch.arange(max_time, dtype=torch.float32)
+        theta_time = torch.outer(t_pos, freq_time)  # (max_time, quarter)
+
+        # Pre-compute electrode positions [n_electrodes] × freqs → [n_elec, quarter]
+        e_pos = torch.arange(n_electrodes, dtype=torch.float32) / n_electrodes
+        theta_elec = torch.outer(e_pos, freq_elec)  # (n_electrodes, quarter)
+
+        self.register_buffer("theta_time", theta_time, persistent=False)
+        self.register_buffer("theta_elec", theta_elec, persistent=False)
+
+    def _get_time_angles(self, T: int, quarter: int, device: torch.device) -> torch.Tensor:
+        """Dynamically generate time angles if T exceeds pre-computed max_time."""
+        if T <= self.theta_time.shape[0]:
+            return self.theta_time[:T]
             
+        # T exceeds max_time (e.g., during testing with full sessions)
+        # Compute frequencies dynamically without bounding
+        freq_time = 1.0 / (
+            self.base_freq ** (torch.arange(0, quarter, dtype=torch.float32, device=device) / quarter)
+        )
+        t_pos = torch.arange(T, dtype=torch.float32, device=device)
+        return torch.outer(t_pos, freq_time)  # (T, quarter)
+
+    def forward(
+        self, T: int, C: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (cos, sin) each of shape (T, C, d_model//2) for Q/K rotation.
+
+        First quarter dims encode time, second quarter encode electrode.
+        """
+        quarter = self.theta_time.shape[1]
         
+        # Time angles: (T, quarter) → (T, 1, quarter) → broadcast to (T, C, quarter)
+        theta_time = self._get_time_angles(T, quarter, self.theta_time.device)
+        t_cos = theta_time.unsqueeze(1).expand(-1, C, -1).cos()
+        t_sin = theta_time.unsqueeze(1).expand(-1, C, -1).sin()
+
+        # Electrode angles: (C, quarter) → (1, C, quarter) → broadcast to (T, C, quarter)
+        # C is strictly bounded by n_electrodes (e.g. 16)
+        e_cos = self.theta_elec[:C].unsqueeze(0).expand(T, -1, -1).cos()
+        e_sin = self.theta_elec[:C].unsqueeze(0).expand(T, -1, -1).sin()
+
+        cos_pe = torch.cat([t_cos, e_cos], dim=-1)  # (T, C, half)
+        sin_pe = torch.cat([t_sin, e_sin], dim=-1)  # (T, C, half)
+        return cos_pe, sin_pe
+
+
+def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary embedding to tensor x of shape (..., d).
+
+    Splits last dim in half, applies rotation, concatenates back.
+    """
+    d = x.shape[-1]
+    x1, x2 = x[..., : d // 2], x[..., d // 2 :]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
+class ElectrodeMixerAttention(nn.Module):
+    """Multi-head attention over the **electrode** dimension for a single band.
+
+    Input shape: (T, N, C, F)  where C = electrode channels, F = freq bins.
+    Output shape: (T, N, d_out).
+
+    At each time step, the C=16 electrodes are the "sequence" for attention.
+    CyRoPE encodes the 2-D (time, electrode) position as a bias.
+
+    Args:
+        in_features (int): Input feature size per electrode (= freq bins or MLP output).
+        d_model (int): Projection dimension for Q/K/V (must be div by 4 for CyRoPE).
+        n_heads (int): Number of attention heads.
+        n_electrodes (int): Number of electrodes per band (default: 16).
+        use_cyrope (bool): Whether to inject CyRoPE (default: True).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        d_model: int,
+        n_heads: int = 4,
+        n_electrodes: int = 16,
+        use_cyrope: bool = True,
+    ) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.d_model = d_model
+        self.use_cyrope = use_cyrope
+
+        self.q_proj = nn.Linear(in_features, d_model)
+        self.k_proj = nn.Linear(in_features, d_model)
+        self.v_proj = nn.Linear(in_features, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+        # Projection from in_features to d_model for skip connection
+        self.input_proj = (
+            nn.Linear(in_features, d_model)
+            if in_features != d_model
+            else nn.Identity()
+        )
+
+        if use_cyrope:
+            self.cyrope = CyRoPE(
+                d_model=self.head_dim,
+                n_electrodes=n_electrodes,
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (T, N, C, F) → output: (T, N, d_model)"""
+        T, N, C, F_in = x.shape
+
+        # Flatten T*N for batched attention over C electrodes
+        x_flat = x.reshape(T * N, C, F_in)  # (T*N, C, F)
+
+        q = self.q_proj(x_flat)  # (T*N, C, d_model)
+        k = self.k_proj(x_flat)
+        v = self.v_proj(x_flat)
+
+        # Reshape to multi-head: (T*N, C, n_heads, head_dim)
+        q = q.view(T * N, C, self.n_heads, self.head_dim)
+        k = k.view(T * N, C, self.n_heads, self.head_dim)
+        v = v.view(T * N, C, self.n_heads, self.head_dim)
+
+        if self.use_cyrope:
+            # CyRoPE over (T, C)
+            cos, sin = self.cyrope(T, C)  # each (T, C, head_dim//2)
+            # Expand for batch: (T, 1, C, head_dim//2) → (T*N, C, head_dim//2)
+            cos = cos.unsqueeze(1).expand(-1, N, -1, -1).reshape(T * N, C, -1)
+            sin = sin.unsqueeze(1).expand(-1, N, -1, -1).reshape(T * N, C, -1)
+            # Apply per head
+            cos_h = cos.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+            sin_h = sin.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+            q = _apply_rotary(q, cos_h, sin_h)
+            k = _apply_rotary(k, cos_h, sin_h)
+
+        # Transpose to (T*N, n_heads, C, head_dim) for attention
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        # Scaled dot-product attention
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_out = torch.matmul(attn_weights, v)  # (T*N, n_heads, C, head_dim)
+
+        # Pool over electrodes (mean) → (T*N, n_heads, head_dim)
+        attn_out = attn_out.mean(dim=2)
+        attn_out = attn_out.reshape(T * N, self.d_model)  # (T*N, d_model)
+
+        out = self.out_proj(attn_out)  # (T*N, d_model)
+
+        # Skip connection + layer norm
+        # Pool input over electrodes for residual
+        residual = self.input_proj(x_flat.mean(dim=1))  # (T*N, d_model)
+        out = self.layer_norm(out + residual)
+
+        return out.view(T, N, self.d_model)  # (T, N, d_model)
+
+
+class MultiBandElectrodeMixer(nn.Module):
+    """Applies ElectrodeMixerAttention independently per band.
+
+    Input: (T, N, num_bands, C, F)
+    Output: (T, N, num_bands, d_model)
+
+    Args:
+        in_features (int): Per-electrode feature dim (freq bins).
+        d_model (int): Output dim per band.
+        n_heads (int): Attention heads.
+        n_electrodes (int): Electrodes per band.
+        use_cyrope (bool): Whether to use CyRoPE.
+        num_bands (int): Number of bands (default: 2).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        d_model: int,
+        n_heads: int = 4,
+        n_electrodes: int = 16,
+        use_cyrope: bool = True,
+        num_bands: int = 2,
+    ) -> None:
+        super().__init__()
+        self.num_bands = num_bands
+        self.mixers = nn.ModuleList(
+            [
+                ElectrodeMixerAttention(
+                    in_features=in_features,
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    n_electrodes=n_electrodes,
+                    use_cyrope=use_cyrope,
+                )
+                for _ in range(num_bands)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (T, N, bands, C, F) → (T, N, bands, d_model)"""
+        assert x.shape[2] == self.num_bands
+        bands = x.unbind(dim=2)
+        outputs = [mixer(band) for mixer, band in zip(self.mixers, bands)]
+        return torch.stack(outputs, dim=2)
+
+
+# ---------------------------------------------------------------------------
+# Attention Refinement Head
+# ---------------------------------------------------------------------------
+
+
+class AttentionRefinementHead(nn.Module):
+    """Small Transformer encoder for CTC-alignment refinement.
+
+    Optionally injects CyRoPE along the time axis only (electrodes already
+    mixed at this point).
+
+    Args:
+        d_model (int): Input/output dimension.
+        n_layers (int): Number of Transformer encoder layers.
+        n_heads (int): Number of attention heads.
+        dim_feedforward (int): FFN hidden dimension.
+        dropout (float): Dropout rate.
+        use_cyrope (bool): Whether to inject CyRoPE on the time axis.
+        max_time (int): Maximum time length for positional encoding.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        use_cyrope: bool = True,
+        max_time: int = 2048,
+    ) -> None:
+        super().__init__()
+        self.use_cyrope = use_cyrope
+        self.d_model = d_model
+
+        if use_cyrope:
+            # Time-only CyRoPE: use d_model-sized positional encoding
+            # We need d_model divisible by 4 for CyRoPE; pad/truncate if needed
+            self.rope_dim = (d_model // 4) * 4
+            if self.rope_dim > 0:
+                self._build_time_rope(max_time)
+        else:
+            # Standard sinusoidal positional encoding
+            self._build_standard_pe(max_time)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,  # expects (T, N, D)
+            norm_first=True,    # Pre-LN
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+    def _build_time_rope(self, max_time: int, device: Optional[torch.device] = None) -> None:
+        """Build sinusoidal positional encoding (time-only, no electrode axis)."""
+        d = self.rope_dim
+        pos = torch.arange(max_time, dtype=torch.float32, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d, 2, dtype=torch.float32, device=device) * -(math.log(10000.0) / d)
+        )
+        pe = torch.zeros(max_time, d, device=device)
+        pe[:, 0::2] = torch.sin(pos * div_term)
+        pe[:, 1::2] = torch.cos(pos * div_term)
+        self.register_buffer("time_pe", pe, persistent=False)  # (max_time, d)
+
+    def _build_standard_pe(self, max_time: int, device: Optional[torch.device] = None) -> None:
+        """Build full d_model sinusoidal PE when CyRoPE isn't used."""
+        pos = torch.arange(max_time, dtype=torch.float32, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32, device=device) * -(math.log(10000.0) / self.d_model)
+        )
+        pe = torch.zeros(max_time, 1, self.d_model, device=device)
+        pe[:, 0, 0::2] = torch.sin(pos * div_term)
+        pe[:, 0, 1::2] = torch.cos(pos * div_term)
+        self.register_buffer("pos_embed", pe, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (T, N, D) → (T, N, D)"""
+        T = x.shape[0]
+
+        if self.use_cyrope and self.rope_dim > 0:
+            if T > self.time_pe.shape[0]:
+                self._build_time_rope(T, device=x.device)
+                
+            # Add sinusoidal time positional encoding
+            pe = self.time_pe[:T].unsqueeze(1)  # (T, 1, rope_dim)
+            if self.rope_dim < self.d_model:
+                # Pad with zeros for remaining dims
+                padding = torch.zeros(
+                    T, 1, self.d_model - self.rope_dim,
+                    device=x.device, dtype=x.dtype,
+                )
+                pe = torch.cat([pe, padding], dim=-1)
+            x = x + pe
+        elif not self.use_cyrope:
+            if T > self.pos_embed.shape[0]:
+                self._build_standard_pe(T, device=x.device)
+            x = x + self.pos_embed[:T]
+
+        return self.encoder(x)
+
+
+# ---------------------------------------------------------------------------
+# Raw Waveform Branch + Gated Fusion
+# ---------------------------------------------------------------------------
+
+
+class RawWaveformEncoder(nn.Module):
+    """Encodes raw EMG waveform with 1D convolutions.
+
+    Total stride = 16 to match spectral branch hop_length=16.
+    Conv-stem: stride-4 → stride-2 → stride-2 = total stride 16.
+
+    Input: (T_raw, N, num_bands, C) — raw EMG with T_raw = 8000 for 4s at 2kHz
+    Output: (T_spec, N, d_out) — temporal dim matches spectral branch
+
+    Args:
+        in_channels (int): Input channels per band × electrodes (= num_bands * C).
+        conv_channels (list): Channel sizes for the 3 conv layers.
+        d_out (int): Output feature dimension.
+        kernel_size (int): Convolution kernel size.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 32,  # 2 bands * 16 electrodes
+        conv_channels: Sequence[int] = (128, 256, 256),
+        d_out: int = 768,
+        kernel_size: int = 5,
+    ) -> None:
+        super().__init__()
+        assert len(conv_channels) == 3, "Need exactly 3 conv layers for stride 4×2×2=16"
+        strides = [4, 2, 2]  # total stride = 16
+
+        layers: list[nn.Module] = []
+        ch_in = in_channels
+        for ch_out, stride in zip(conv_channels, strides):
+            pad = kernel_size // 2
+            layers.extend([
+                nn.Conv1d(ch_in, ch_out, kernel_size, stride=stride, padding=pad),
+                nn.BatchNorm1d(ch_out),
+                nn.SiLU(),
+            ])
+            ch_in = ch_out
+
+        self.conv_stem = nn.Sequential(*layers)
+        self.proj = nn.Linear(conv_channels[-1], d_out)
+        self.norm = nn.LayerNorm(d_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (T_raw, N, bands, C) → (T_spec, N, d_out)"""
+        T_raw, N, bands, C = x.shape
+
+        # Flatten bands and channels: (T_raw, N, bands*C)
+        x = x.reshape(T_raw, N, bands * C)
+
+        # → (N, bands*C, T_raw) for Conv1d
+        x = x.permute(1, 2, 0)
+
+        # Apply conv stem (stride-16 total)
+        x = self.conv_stem(x)  # (N, ch_out, T_spec)
+
+        # → (T_spec, N, ch_out)
+        x = x.permute(2, 0, 1)
+
+        # Project to d_out
+        x = self.proj(x)
+        return self.norm(x)
+
+
+class GatedFusion(nn.Module):
+    """Gated fusion of spectral and raw waveform features.
+
+    Learns a gating weight per feature dimension to blend two streams.
+
+    Args:
+        d_model (int): Feature dimension of both branches.
+        fusion_type (str): "gated", "concat", or "add".
+    """
+
+    def __init__(self, d_model: int, fusion_type: str = "gated") -> None:
+        super().__init__()
+        self.fusion_type = fusion_type
+        self.d_model = d_model
+
+        if fusion_type == "gated":
+            self.gate = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.Sigmoid(),
+            )
+        elif fusion_type == "concat":
+            self.proj = nn.Linear(d_model * 2, d_model)
+        # "add" needs no parameters
+
+    def forward(
+        self, spectral: torch.Tensor, raw: torch.Tensor
+    ) -> torch.Tensor:
+        """spectral, raw: (T, N, D) → (T, N, D)
+
+        Asserts temporal alignment between branches.
+        """
+        assert spectral.shape[0] == raw.shape[0], (
+            f"Temporal dim mismatch: spectral T={spectral.shape[0]} "
+            f"vs raw T={raw.shape[0]}. Check Conv-stem stride matches hop_length."
+        )
+
+        if self.fusion_type == "gated":
+            combined = torch.cat([spectral, raw], dim=-1)  # (T, N, 2D)
+            gate = self.gate(combined)  # (T, N, D) in [0, 1]
+            return gate * spectral + (1 - gate) * raw
+        elif self.fusion_type == "concat":
+            combined = torch.cat([spectral, raw], dim=-1)
+            return self.proj(combined)
+        else:  # add
+            return spectral + raw
+
+
+# ---------------------------------------------------------------------------
+# Top-level Composite Model
+# ---------------------------------------------------------------------------
+
+
+class TransformerBackbone(nn.Module):
+    """Transformer encoder backbone for temporal modeling.
+
+    Operates on (T, N, D). Caller should ensure this shape.
+
+    Args:
+        d_model (int): Model dimension.
+        n_layers (int): Number of Transformer layers.
+        n_heads (int): Number of attention heads.
+        dim_feedforward (int): Feedforward network dimension.
+        dropout (float): Dropout probability.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_layers: int = 4,
+        n_heads: int = 8,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
         
+        # Precompute initial sinusoidal positional encodings
+        self.max_time = 4096
+        self._build_pe(self.max_time)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,  # expects (T, N, D)
+            norm_first=True,    # Pre-LN
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+    def _build_pe(self, max_time: int, device: Optional[torch.device] = None) -> None:
+        pos = torch.arange(max_time, dtype=torch.float32, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32, device=device) * -(math.log(10000.0) / self.d_model)
+        )
+        pe = torch.zeros(max_time, 1, self.d_model, device=device)
+        pe[:, 0, 0::2] = torch.sin(pos * div_term)
+        pe[:, 0, 1::2] = torch.cos(pos * div_term)
+        self.register_buffer("pos_embed", pe, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (T, N, D) → (T, N, D)"""
+        T = x.shape[0]
+        if T > self.pos_embed.shape[0]:
+            self._build_pe(T, device=x.device)
+            
+        x = x + self.pos_embed[:T]
+        return self.encoder(x)
+
+
+class CyRo2FormersEncoder(nn.Module):
+    """CyRo2Formers: core temporal encoder and dual-branch fusion.
+
+    Pipeline:
+        [Input from frontend] → TransformerBackbone → [optional: fuse with RawWaveformEncoder] →
+        [optional: AttentionRefinementHead]
+        
+    Args:
+        backbone_d_model (int): Transformer model dimension.
+        backbone_n_layers (int): Number of Transformer blocks.
+        transformer_n_heads (int): Number of attention heads.
+        transformer_dim_feedforward (int): Transformer FFN dim.
+        transformer_dropout (float): Transformer dropout.
+        use_attention_head (bool): Toggle attention refinement head.
+        attn_n_layers (int): Number of attention layers.
+        attn_n_heads (int): Number of attention heads.
+        attn_dim_feedforward (int): Attention FFN dim.
+        attn_dropout (float): Attention dropout.
+        use_cyrope (bool): Toggle CyRoPE in attention head.
+        use_spectral_branch (bool): Toggle raw waveform branch + fusion.
+        spectral_conv_channels (list): Raw branch conv channels.
+        spectral_kernel_size (int): Raw branch kernel size.
+        fusion_type (str): Fusion method ("gated", "concat", "add").
+        num_bands (int): Number of EMG bands (default: 2).
+        n_electrodes (int): Electrodes per band (default: 16).
+    """
+
+    def __init__(
+        self,
+        backbone_d_model: int = 768,
+        backbone_n_layers: int = 4,
+        transformer_n_heads: int = 8,
+        transformer_dim_feedforward: int = 2048,
+        transformer_dropout: float = 0.1,
+        # Attention refinement
+        use_attention_head: bool = True,
+        attn_n_layers: int = 2,
+        attn_n_heads: int = 8,
+        attn_dim_feedforward: int = 1024,
+        attn_dropout: float = 0.1,
+        use_cyrope: bool = True,
+        # Spectral branch
+        use_spectral_branch: bool = True,
+        spectral_conv_channels: Sequence[int] = (128, 256, 256),
+        spectral_kernel_size: int = 5,
+        fusion_type: str = "gated",
+        # Data constants
+        num_bands: int = 2,
+        n_electrodes: int = 16,
+    ) -> None:
+        super().__init__()
+        self.use_spectral_branch = use_spectral_branch
+        self.use_attention_head = use_attention_head
+
+        # temporal backbone
+        self.backbone = TransformerBackbone(
+            d_model=backbone_d_model,
+            n_layers=backbone_n_layers,
+            n_heads=transformer_n_heads,
+            dim_feedforward=transformer_dim_feedforward,
+            dropout=transformer_dropout,
+        )
+
+        # Raw waveform branch + fusion
+        if use_spectral_branch:
+            self.raw_encoder = RawWaveformEncoder(
+                in_channels=num_bands * n_electrodes,
+                conv_channels=list(spectral_conv_channels),
+                d_out=backbone_d_model,
+                kernel_size=spectral_kernel_size,
+            )
+            self.fusion = GatedFusion(
+                d_model=backbone_d_model,
+                fusion_type=fusion_type,
+            )
+
+        # Attention refinement head
+        if use_attention_head:
+            self.attn_head = AttentionRefinementHead(
+                d_model=backbone_d_model,
+                n_layers=attn_n_layers,
+                n_heads=attn_n_heads,
+                dim_feedforward=attn_dim_feedforward,
+                dropout=attn_dropout,
+                use_cyrope=use_cyrope,
+            )
+
+    def forward(
+        self,
+        spectral_features: torch.Tensor,
+        raw_input: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            spectral_features: (T, N, D) — output from frontend processing.
+            raw_input: (T_raw, N, bands=2, C=16) — raw EMG (only when use_spectral_branch=True).
+
+        Returns:
+            features: (T, N, D) — encoded features.
+        """
+        # Temporal backbone
+        x = self.backbone(spectral_features)    # Transformer expects (T, N, D)
+
+        # Fuse with raw waveform branch
+        if self.use_spectral_branch and raw_input is not None:
+            raw_features = self.raw_encoder(raw_input)  # (T, N, D)
+            x = self.fusion(x, raw_features)
+
+        # Attention refinement head
+        if self.use_attention_head:
+            x = self.attn_head(x)  # (T, N, D)
+
+        return x

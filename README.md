@@ -47,6 +47,37 @@ The results indicate that the CNN baseline model is not well suited for this tas
 PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train user=single_user model=cnn_ctc
 ```
 
+## Transformer Model
+
+1. CyRoPE Positional Encoding on time + electrode position: learning consistent spatial relations, used in both MultibandElectrodeMixer and Transformer.
+2. MultiBandElectrodeMixer: Learning global spatial relationships with 4 attention heads with CyRope
+3. Transformer: a tightly constrained 2-layer Pre-LN Transformer with 8 attention heads, a feed-forward dimension of 1024, and 0.15 dropout
+4. Spectral Branch (currently set optional): parallel to raw waveform path, compute time-frequency representation and encode with a lightweight temporal encoder.
+5. Attention Refinement Head: fuse two branches and polish step
+6. Decoding with a character-level 6-gram language model, same as original paper.
+
+## Results
+
+| Metric   | DataLoader 0       |
+| -------- | ------------------ |
+| val/CER  | 18.07709312438965  |
+| val/DER  | 2.326096534729004  |
+| val/IER  | 6.357997417449951  |
+| val/SER  | 9.392999649047852  |
+| val/loss | 0.6290462613105774 |
+
+| Metric    | DataLoader 0       |
+| --------- | ------------------ |
+| test/CER  | 19.423992156982422 |
+| test/DER  | 3.2698137760162354 |
+| test/IER  | 4.785621643066406  |
+| test/SER  | 11.368557929992676 |
+| test/loss | 0.7223228812217712 |
+
+```shell
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc ++train=false ++checkpoint=./logs/2026-02-26/01-30-51/checkpoints/last.ckpt
+```
+
 ## License
 
 emg2qwerty is CC-BY-NC-4.0 licensed, as found in the LICENSE file.

@@ -476,7 +476,7 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return int(max(self.session_length - self.window_length, 0) // self.stride + 1)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor | dict[str, torch.Tensor], torch.Tensor]:
         # Lazy init `EMGSessionData` per dataloading worker
         # since `h5py.File` objects can't be picked.
         if not hasattr(self, "session"):
@@ -496,9 +496,8 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         window_end = offset + self.window_length + self.right_padding
         window = self.session[window_start:window_end]
 
-        # Extract EMG tensor corresponding to the window.
+        # Extract EMG tensor (or dict mapping) corresponding to the window.
         emg = self.transform(window)
-        assert torch.is_tensor(emg)
 
         # Extract labels corresponding to the original (un-padded) window.
         timestamps = window[EMGSessionData.TIMESTAMPS]
@@ -511,7 +510,7 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def collate(
-        samples: Sequence[tuple[torch.Tensor, torch.Tensor]]
+        samples: Sequence[tuple[torch.Tensor | dict[str, torch.Tensor], torch.Tensor]]
     ) -> dict[str, torch.Tensor]:
         """Collates a list of samples into a padded batch of inputs and targets.
         Each input sample in the list should be a tuple of (input, target) tensors.
@@ -520,8 +519,30 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
 
         Follows time-first format. That is, the retured batch is of shape (T, N, ...).
         """
-        inputs = [sample[0] for sample in samples]  # [(T, ...)]
+        inputs = [sample[0] for sample in samples]  # [(T, ...)] or list of dicts
         targets = [sample[1] for sample in samples]  # [(T,)]
+
+        # Check if dual branch format
+        if isinstance(inputs[0], dict):
+            input_batch = nn.utils.rnn.pad_sequence([inp["spectral"] for inp in inputs])
+            raw_batch = nn.utils.rnn.pad_sequence([inp["raw"] for inp in inputs])
+            
+            target_batch = nn.utils.rnn.pad_sequence(targets)
+
+            input_lengths = torch.as_tensor(
+                [len(inp["spectral"]) for inp in inputs], dtype=torch.int32
+            )
+            target_lengths = torch.as_tensor(
+                [len(target) for target in targets], dtype=torch.int32
+            )
+
+            return {
+                "inputs": input_batch,
+                "raw_inputs": raw_batch,
+                "targets": target_batch,
+                "input_lengths": input_lengths,
+                "target_lengths": target_lengths,
+            }
 
         # Batch of inputs and targets padded along time
         input_batch = nn.utils.rnn.pad_sequence(inputs)  # (T, N, ...)
