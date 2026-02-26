@@ -25,16 +25,30 @@ specaug:
   n_freq_masks: 2
   freq_mask_param: 4
 
+dual_branch:
+  _target_: emg2qwerty.transforms.DualBranchTransform
+  spectral_transforms:
+    _target_: emg2qwerty.transforms.Compose
+    transforms:
+    - ${logspec}
+    - ${specaug}
+
+dual_branch_val:
+  _target_: emg2qwerty.transforms.DualBranchTransform
+  spectral_transforms:
+    _target_: emg2qwerty.transforms.Compose
+    transforms:
+    - ${logspec}
+
 transforms:
   train:
     - ${to_tensor}
     - ${band_rotation}
     - ${temporal_jitter}
-    - ${logspec}
-    - ${specaug}
+    - ${dual_branch}
 
   val:
     - ${to_tensor}
-    - ${logspec}
+    - ${dual_branch_val}
 
   test: ${transforms.val}
