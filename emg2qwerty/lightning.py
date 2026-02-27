@@ -627,9 +627,34 @@ class CyRo2FormersCTCModule(pl.LightningModule):
         self._epoch_end("test")
 
     def configure_optimizers(self) -> dict[str, Any]:
-        return utils.instantiate_optimizer_and_scheduler(
-            self.parameters(),
-            optimizer_config=self.hparams.optimizer,
-            lr_scheduler_config=self.hparams.lr_scheduler,
-        )
+        opt_cfg = self.hparams.optimizer
+        assert opt_cfg is not None, "Optimizer must be specified in config"
+
+        # Separate raw_encoder parameters for ablation stability
+        raw_encoder_params = set()
+        if hasattr(self.encoder, "raw_encoder") and self.encoder.raw_encoder is not None:
+            raw_encoder_params = set(self.encoder.raw_encoder.parameters())
+
+        global_params = [p for p in self.parameters() if p not in raw_encoder_params]
+        
+        # 1D CNNs on raw signals have sharper gradients. Lower LR by 10x to prevent explosion
+        param_groups = [
+            {"params": global_params, "lr": opt_cfg.lr},
+        ]
+        if raw_encoder_params:
+            param_groups.append(
+                {"params": list(raw_encoder_params), "lr": opt_cfg.lr * 0.1}
+            )
+
+        # Re-implement utils hook manually to handle param groups
+        import hydra
+        optimizer = hydra.utils.instantiate(opt_cfg, param_groups)
+        scheduler = hydra.utils.instantiate(self.hparams.lr_scheduler.scheduler, optimizer)
+        lr_scheduler = hydra.utils.instantiate(self.hparams.lr_scheduler, scheduler=scheduler)
+        
+        import omegaconf
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": omegaconf.OmegaConf.to_container(lr_scheduler),
+        }
 

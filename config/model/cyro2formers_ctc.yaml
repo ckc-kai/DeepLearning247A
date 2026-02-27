@@ -29,7 +29,7 @@ module:
   spectral_kernel_size: 5
 
   # --- Fusion ---
-  fusion_type: "gated"       # "gated", "concat", "add"
+  fusion_type: "weighted"       # "gated", "concat", "add"
 
 datamodule:
   _target_: emg2qwerty.lightning.WindowedEMGDataModule

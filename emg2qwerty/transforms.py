@@ -251,7 +251,14 @@ class DualBranchTransform:
     spectral_transforms: Transform[torch.Tensor, torch.Tensor]
 
     def __call__(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+        # Standardize the raw waveform along the temporal dimension (dim=0)
+        # tensor is of shape (T, N, C) or (T, C)
+        raw = tensor.clone()
+        mean = raw.mean(dim=0, keepdim=True)
+        std = raw.std(dim=0, keepdim=True)
+        raw_normalized = (raw - mean) / (std + 1e-5)
+
         return {
-            "raw": tensor.clone(),
+            "raw": raw_normalized,
             "spectral": self.spectral_transforms(tensor)
         }

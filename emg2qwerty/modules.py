@@ -855,51 +855,60 @@ class RawWaveformEncoder(nn.Module):
         return self.norm(x)
 
 
-class GatedFusion(nn.Module):
-    """Gated fusion of spectral and raw waveform features.
-
-    Learns a gating weight per feature dimension to blend two streams.
-
-    Args:
-        d_model (int): Feature dimension of both branches.
-        fusion_type (str): "gated", "concat", or "add".
+class CrossAttentionFusion(nn.Module):
+    """
+    Fuses spectral and raw waveform features via Cross-Attention.
+    Spectral acts as Query (Q), establishing the stable temporal frame.
+    Raw acts as Key/Value (KV), providing high-res micro-spike refinement.
+    
+    The output projection is explicitly initialized to 0.0, establishing
+    a perfect residual connection (SkipInit) so the model starts at 100% 
+    spectral baseline and safely learns to incorporate raw attention.
     """
 
-    def __init__(self, d_model: int, fusion_type: str = "gated") -> None:
+    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1) -> None:
         super().__init__()
-        self.fusion_type = fusion_type
         self.d_model = d_model
+        
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=False  # Operates on (T, N, D)
+        )
+        
+        self.norm_spectral = nn.LayerNorm(d_model)
+        self.norm_raw = nn.LayerNorm(d_model)
 
-        if fusion_type == "gated":
-            self.gate = nn.Sequential(
-                nn.Linear(d_model * 2, d_model),
-                nn.Sigmoid(),
-            )
-        elif fusion_type == "concat":
-            self.proj = nn.Linear(d_model * 2, d_model)
-        # "add" needs no parameters
+        # SkipInit: Zero-initialize the final output projection of the Cross-Attention
+        # This guarantees that at epoch 0, the attention block outputs exactly 0.0
+        # Output = Spectral + 0.0 -> Perfect residual baseline
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.bias)
 
     def forward(
         self, spectral: torch.Tensor, raw: torch.Tensor
     ) -> torch.Tensor:
-        """spectral, raw: (T, N, D) → (T, N, D)
-
-        Asserts temporal alignment between branches.
-        """
-        assert spectral.shape[0] == raw.shape[0], (
-            f"Temporal dim mismatch: spectral T={spectral.shape[0]} "
-            f"vs raw T={raw.shape[0]}. Check Conv-stem stride matches hop_length."
-        )
-
-        if self.fusion_type == "gated":
-            combined = torch.cat([spectral, raw], dim=-1)  # (T, N, 2D)
-            gate = self.gate(combined)  # (T, N, D) in [0, 1]
-            return gate * spectral + (1 - gate) * raw
-        elif self.fusion_type == "concat":
-            combined = torch.cat([spectral, raw], dim=-1)
-            return self.proj(combined)
-        else:  # add
-            return spectral + raw
+        """spectral, raw: (T, N, D) → (T, N, D)"""
+        
+        # Soft-align sequence lengths just in case of slight padding mismatches
+        if raw.shape[0] > spectral.shape[0]:
+            raw = raw[:spectral.shape[0]]
+        elif raw.shape[0] < spectral.shape[0]:
+            pad_len = spectral.shape[0] - raw.shape[0]
+            pad_tensor = torch.zeros(pad_len, raw.shape[1], raw.shape[2], device=raw.device, dtype=raw.dtype)
+            raw = torch.cat([raw, pad_tensor], dim=0)
+            
+        # Standard Pre-Norm residual path
+        q = self.norm_spectral(spectral)
+        k = v = self.norm_raw(raw)
+        
+        # Cross Attention: Q=Spectral, KV=Raw
+        # Returns (T, N, D)
+        attn_out, _ = self.cross_attn(query=q, key=k, value=v)
+        
+        # Residual connection (attn_out is 0.0 at initialization)
+        return spectral + attn_out
 
 
 # ---------------------------------------------------------------------------
@@ -1037,9 +1046,8 @@ class CyRo2FormersEncoder(nn.Module):
                 d_out=backbone_d_model,
                 kernel_size=spectral_kernel_size,
             )
-            self.fusion = GatedFusion(
+            self.fusion = CrossAttentionFusion(
                 d_model=backbone_d_model,
-                fusion_type=fusion_type,
             )
 
         # Attention refinement head
