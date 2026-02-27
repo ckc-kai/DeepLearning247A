@@ -23,14 +23,10 @@ module:
   attn_dim_feedforward: 1024
   attn_dropout: 0.1
 
-  # --- Spectral Branch ---
-  use_spectral_branch: true    # Enabled for ablation study
-  spectral_conv_channels: [128, 256, 256]
-  spectral_kernel_size: 5
-
-  # --- Fusion ---
-  fusion_type: "weighted"       # "gated", "concat", "add"
-
+  # --- Spectral Pre-training ---
+  pretraining_mode: true       # Toggle to true for pre-training, false for CTC
+  masking_ratio: 0.30
+  num_clusters: 500
 datamodule:
   _target_: emg2qwerty.lightning.WindowedEMGDataModule
   window_length: 8000        # 4 sec windows for 2kHz EMG

@@ -58,6 +58,8 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train user=single_user model=
 
 ## Results
 
+### Transformer + CyRoPE + MultiBandElectrodeMixer
+
 | Metric   | DataLoader 0       |
 | -------- | ------------------ |
 | val/CER  | 18.07709312438965  |
@@ -76,6 +78,28 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train user=single_user model=
 
 ```shell
 PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc ++train=false ++checkpoint=./logs/2026-02-26/01-30-51/checkpoints/last.ckpt
+```
+
+### Transformer + CyRoPE + MultiBandElectrodeMixer + Pretrain
+
+| Metric   | DataLoader 0       |
+| -------- | ------------------ |
+| val/CER  | 15.573770523071289 |
+| val/DER  | 1.9273371696472168 |
+| val/IER  | 5.405405521392822  |
+| val/SER  | 8.24102783203125   |
+| val/loss | 0.5256414413452148 |
+
+| Metric    | DataLoader 0       |
+| --------- | ------------------ |
+| test/CER  | 17.410133361816406 |
+| test/DER  | 2.2520570755004883 |
+| test/IER  | 5.391944408416748  |
+| test/SER  | 9.766132354736328  |
+| test/loss | 0.5921993851661682 |
+
+```shell
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc
 ```
 
 ## License

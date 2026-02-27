@@ -452,6 +452,10 @@ class CyRo2FormersCTCModule(pl.LightningModule):
         attn_n_heads: int = 8,
         attn_dim_feedforward: int = 1024,
         attn_dropout: float = 0.1,
+        # Spectral Pre-training
+        pretraining_mode: bool = False,
+        masking_ratio: float = 0.3,
+        num_clusters: int = 500,
         # Spectral branch
         use_spectral_branch: bool = True,
         spectral_conv_channels: Sequence[int] = (128, 256, 256),
@@ -507,13 +511,13 @@ class CyRo2FormersCTCModule(pl.LightningModule):
             attn_dim_feedforward=attn_dim_feedforward,
             attn_dropout=attn_dropout,
             use_cyrope=use_cyrope,
-            use_spectral_branch=use_spectral_branch,
-            spectral_conv_channels=spectral_conv_channels,
-            spectral_kernel_size=spectral_kernel_size,
-            fusion_type=fusion_type,
-            num_bands=self.NUM_BANDS,
-            n_electrodes=self.ELECTRODE_CHANNELS,
+            pretraining_mode=pretraining_mode,
+            masking_ratio=masking_ratio,
+            num_clusters=num_clusters
         )
+
+        self.pretraining_mode = pretraining_mode
+        self.num_clusters = num_clusters
 
         self.classifier = nn.Sequential(
             nn.Linear(backbone_d_model, charset().num_classes),
@@ -522,8 +526,10 @@ class CyRo2FormersCTCModule(pl.LightningModule):
 
         # Criterion
         self.ctc_loss = nn.CTCLoss(blank=charset().null_class, zero_infinity=True)
+        if self.pretraining_mode:
+            self.pretrain_loss = nn.CrossEntropyLoss()
 
-        # Decoder
+        # Decoder (Always instantiated for Character Error Rate logging)
         self.decoder = instantiate(decoder)
 
         # Metrics
@@ -538,8 +544,8 @@ class CyRo2FormersCTCModule(pl.LightningModule):
     def forward(
         self,
         spectral_input: torch.Tensor,
-        raw_input: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        mask_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # 1. Normalize spectrograms
         x_norm = self.spec_norm(spectral_input)
         
@@ -553,8 +559,12 @@ class CyRo2FormersCTCModule(pl.LightningModule):
         x_proj = self.frontend_proj(x_combined)         # (T, N, backbone_d_model)
         
         # 4. Sequence Modeling & Classification
-        x_enc = self.encoder(x_proj, raw_input)
-        return self.classifier(x_enc)
+        if self.pretraining_mode:
+            x_enc, pretrain_logits = self.encoder(x_proj, mask_indices)
+            return self.classifier(x_enc), pretrain_logits
+        else:
+            x_enc = self.encoder(x_proj)
+            return self.classifier(x_enc)
 
     def _step(
         self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
@@ -565,33 +575,75 @@ class CyRo2FormersCTCModule(pl.LightningModule):
         target_lengths = batch["target_lengths"]
         N = len(input_lengths)
 
-        # Get optional raw input
-        raw_input = batch.get("raw_inputs", None)
+        if self.pretraining_mode and "mask_indices" in batch:
+            # Multi-Task Learning: Compute Masked Spectral Pre-training logic 
+            import pickle
+            from pathlib import Path
+            
+            # 1. Unpack forward pass
+            mask_indices = batch["mask_indices"] # (T, N)
+            emissions, pretrain_logits = self.forward(inputs, mask_indices)
+            
+            # 2. Compute TRUE Pseudo-labels for the masked frames
+            T, N, bands, C, freq = inputs.shape
+            flattened_inputs = inputs.reshape(T * N, bands * C * freq).detach().cpu().numpy()
+            
+            # Load the K-Means offline model lazily
+            if not hasattr(self, "kmeans_model"):
+                kmeans_path = Path("data/spectre_kmeans_500.pkl")
+                if not kmeans_path.exists():
+                    raise FileNotFoundError("generate_spectre_clusters.py has not been run!")
+                with open(kmeans_path, "rb") as f:
+                    self.kmeans_model = pickle.load(f)
+            
+            # Predict the true cluster IDs
+            true_clusters = self.kmeans_model.predict(flattened_inputs) # (T*N,)
+            true_clusters = torch.from_numpy(true_clusters).to(inputs.device).long()
+            true_clusters = true_clusters.view(T, N)
+            
+            # 3. Filter logits and targets to ONLY the masked positions
+            masked_logits = pretrain_logits[mask_indices] # (num_masked_ops, num_clusters)
+            masked_targets = true_clusters[mask_indices]  # (num_masked_ops,)
+            
+            if masked_logits.shape[0] == 0:
+                pretrain_loss = torch.tensor(0.0, device=inputs.device, requires_grad=True)
+            else:
+                pretrain_loss = self.pretrain_loss(masked_logits, masked_targets)
+            
+            self.log(f"{phase}/pretrain_loss", pretrain_loss, batch_size=N, sync_dist=True)
 
-        emissions = self.forward(inputs, raw_input)
+        else:
+            # Standard CTC Fine-tuning logic
+            if self.pretraining_mode:
+                emissions, _ = self.forward(inputs)
+            else:
+                emissions = self.forward(inputs)
+            pretrain_loss = 0.0
 
-        # The model does not downsample temporally (Transformer preserves T),
-        # but spectrogram hop already reduced T. Compute emission lengths
-        # using ratio in case any component introduces slight T changes.
+        # CTC Loss Computation (always happens)
         T_in = inputs.shape[0]
         T_out = emissions.shape[0]
         emission_lengths = torch.div(
             input_lengths * T_out, T_in, rounding_mode="floor"
         )
-
-        loss = self.ctc_loss(
+    
+        ctc_loss = self.ctc_loss(
             log_probs=emissions,
             targets=targets.transpose(0, 1),
             input_lengths=emission_lengths,
             target_lengths=target_lengths,
         )
-
+        
+        # Combine losses if doing Multi-Task Learning
+        # The pretrain_loss acts as an auxiliary self-supervised regularizer
+        total_loss = ctc_loss + pretrain_loss
+    
         # Decode emissions
         predictions = self.decoder.decode_batch(
             emissions=emissions.detach().cpu().numpy(),
             emission_lengths=emission_lengths.detach().cpu().numpy(),
         )
-
+    
         # Update metrics
         metrics = self.metrics[f"{phase}_metrics"]
         targets = targets.detach().cpu().numpy()
@@ -599,9 +651,11 @@ class CyRo2FormersCTCModule(pl.LightningModule):
         for i in range(N):
             target = LabelData.from_labels(targets[: target_lengths[i], i])
             metrics.update(prediction=predictions[i], target=target)
-
-        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
-        return loss
+    
+        self.log(f"{phase}/loss", total_loss, batch_size=N, sync_dist=True)
+        self.log(f"{phase}/ctc_loss", ctc_loss, batch_size=N, sync_dist=True)
+        
+        return total_loss
 
     def _epoch_end(self, phase: str) -> None:
         metrics = self.metrics[f"{phase}_metrics"]

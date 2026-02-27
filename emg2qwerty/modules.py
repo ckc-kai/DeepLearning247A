@@ -787,129 +787,6 @@ class AttentionRefinementHead(nn.Module):
         return self.encoder(x)
 
 
-# ---------------------------------------------------------------------------
-# Raw Waveform Branch + Gated Fusion
-# ---------------------------------------------------------------------------
-
-
-class RawWaveformEncoder(nn.Module):
-    """Encodes raw EMG waveform with 1D convolutions.
-
-    Total stride = 16 to match spectral branch hop_length=16.
-    Conv-stem: stride-4 → stride-2 → stride-2 = total stride 16.
-
-    Input: (T_raw, N, num_bands, C) — raw EMG with T_raw = 8000 for 4s at 2kHz
-    Output: (T_spec, N, d_out) — temporal dim matches spectral branch
-
-    Args:
-        in_channels (int): Input channels per band × electrodes (= num_bands * C).
-        conv_channels (list): Channel sizes for the 3 conv layers.
-        d_out (int): Output feature dimension.
-        kernel_size (int): Convolution kernel size.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 32,  # 2 bands * 16 electrodes
-        conv_channels: Sequence[int] = (128, 256, 256),
-        d_out: int = 768,
-        kernel_size: int = 5,
-    ) -> None:
-        super().__init__()
-        assert len(conv_channels) == 3, "Need exactly 3 conv layers for stride 4×2×2=16"
-        strides = [4, 2, 2]  # total stride = 16
-
-        layers: list[nn.Module] = []
-        ch_in = in_channels
-        for ch_out, stride in zip(conv_channels, strides):
-            pad = kernel_size // 2
-            layers.extend([
-                nn.Conv1d(ch_in, ch_out, kernel_size, stride=stride, padding=pad),
-                nn.BatchNorm1d(ch_out),
-                nn.SiLU(),
-            ])
-            ch_in = ch_out
-
-        self.conv_stem = nn.Sequential(*layers)
-        self.proj = nn.Linear(conv_channels[-1], d_out)
-        self.norm = nn.LayerNorm(d_out)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (T_raw, N, bands, C) → (T_spec, N, d_out)"""
-        T_raw, N, bands, C = x.shape
-
-        # Flatten bands and channels: (T_raw, N, bands*C)
-        x = x.reshape(T_raw, N, bands * C)
-
-        # → (N, bands*C, T_raw) for Conv1d
-        x = x.permute(1, 2, 0)
-
-        # Apply conv stem (stride-16 total)
-        x = self.conv_stem(x)  # (N, ch_out, T_spec)
-
-        # → (T_spec, N, ch_out)
-        x = x.permute(2, 0, 1)
-
-        # Project to d_out
-        x = self.proj(x)
-        return self.norm(x)
-
-
-class CrossAttentionFusion(nn.Module):
-    """
-    Fuses spectral and raw waveform features via Cross-Attention.
-    Spectral acts as Query (Q), establishing the stable temporal frame.
-    Raw acts as Key/Value (KV), providing high-res micro-spike refinement.
-    
-    The output projection is explicitly initialized to 0.0, establishing
-    a perfect residual connection (SkipInit) so the model starts at 100% 
-    spectral baseline and safely learns to incorporate raw attention.
-    """
-
-    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1) -> None:
-        super().__init__()
-        self.d_model = d_model
-        
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=False  # Operates on (T, N, D)
-        )
-        
-        self.norm_spectral = nn.LayerNorm(d_model)
-        self.norm_raw = nn.LayerNorm(d_model)
-
-        # SkipInit: Zero-initialize the final output projection of the Cross-Attention
-        # This guarantees that at epoch 0, the attention block outputs exactly 0.0
-        # Output = Spectral + 0.0 -> Perfect residual baseline
-        nn.init.zeros_(self.cross_attn.out_proj.weight)
-        nn.init.zeros_(self.cross_attn.out_proj.bias)
-
-    def forward(
-        self, spectral: torch.Tensor, raw: torch.Tensor
-    ) -> torch.Tensor:
-        """spectral, raw: (T, N, D) → (T, N, D)"""
-        
-        # Soft-align sequence lengths just in case of slight padding mismatches
-        if raw.shape[0] > spectral.shape[0]:
-            raw = raw[:spectral.shape[0]]
-        elif raw.shape[0] < spectral.shape[0]:
-            pad_len = spectral.shape[0] - raw.shape[0]
-            pad_tensor = torch.zeros(pad_len, raw.shape[1], raw.shape[2], device=raw.device, dtype=raw.dtype)
-            raw = torch.cat([raw, pad_tensor], dim=0)
-            
-        # Standard Pre-Norm residual path
-        q = self.norm_spectral(spectral)
-        k = v = self.norm_raw(raw)
-        
-        # Cross Attention: Q=Spectral, KV=Raw
-        # Returns (T, N, D)
-        attn_out, _ = self.cross_attn(query=q, key=k, value=v)
-        
-        # Residual connection (attn_out is 0.0 at initialization)
-        return spectral + attn_out
-
 
 # ---------------------------------------------------------------------------
 # Top-level Composite Model
@@ -1016,18 +893,28 @@ class CyRo2FormersEncoder(nn.Module):
         attn_dim_feedforward: int = 1024,
         attn_dropout: float = 0.1,
         use_cyrope: bool = True,
-        # Spectral branch
-        use_spectral_branch: bool = True,
-        spectral_conv_channels: Sequence[int] = (128, 256, 256),
-        spectral_kernel_size: int = 5,
-        fusion_type: str = "gated",
-        # Data constants
-        num_bands: int = 2,
-        n_electrodes: int = 16,
+        # Spectral Pre-training
+        pretraining_mode: bool = False,
+        masking_ratio: float = 0.30,
+        num_clusters: int = 500,
     ) -> None:
         super().__init__()
-        self.use_spectral_branch = use_spectral_branch
         self.use_attention_head = use_attention_head
+        self.pretraining_mode = pretraining_mode
+        self.masking_ratio = masking_ratio
+        
+        if pretraining_mode:
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, backbone_d_model))
+            # Initialize with small variance
+            torch.nn.init.normal_(self.mask_token, std=0.02)
+            
+            # Lightweight MLP head to predict cluster IDs from masked embeddings
+            self.reconstruction_head = nn.Sequential(
+                nn.Linear(backbone_d_model, backbone_d_model * 2),
+                nn.GELU(),
+                nn.LayerNorm(backbone_d_model * 2),
+                nn.Linear(backbone_d_model * 2, num_clusters)
+            )
 
         # temporal backbone
         self.backbone = TransformerBackbone(
@@ -1038,17 +925,6 @@ class CyRo2FormersEncoder(nn.Module):
             dropout=transformer_dropout,
         )
 
-        # Raw waveform branch + fusion
-        if use_spectral_branch:
-            self.raw_encoder = RawWaveformEncoder(
-                in_channels=num_bands * n_electrodes,
-                conv_channels=list(spectral_conv_channels),
-                d_out=backbone_d_model,
-                kernel_size=spectral_kernel_size,
-            )
-            self.fusion = CrossAttentionFusion(
-                d_model=backbone_d_model,
-            )
 
         # Attention refinement head
         if use_attention_head:
@@ -1064,26 +940,37 @@ class CyRo2FormersEncoder(nn.Module):
     def forward(
         self,
         spectral_features: torch.Tensor,
-        raw_input: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        mask_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             spectral_features: (T, N, D) — output from frontend processing.
-            raw_input: (T_raw, N, bands=2, C=16) — raw EMG (only when use_spectral_branch=True).
+            mask_indices: (T, N) — Optional boolean mask where True means apply mask_token.
 
         Returns:
             features: (T, N, D) — encoded features.
+            logits: (T, N, num_clusters) — ONLY returned if pretraining_mode=True
         """
-        # Temporal backbone
-        x = self.backbone(spectral_features)    # Transformer expects (T, N, D)
+        # Apply mask token if pre-training
+        if self.pretraining_mode and mask_indices is not None:
+            # spectral_features is (T, N, D)
+            # mask_indices is (T, N) boolean array
+            mask_expanded = mask_indices.unsqueeze(-1) # (T, N, 1)
+            # Replace True indices with the learned mask_token
+            x = torch.where(mask_expanded, self.mask_token.expand_as(spectral_features), spectral_features)
+        else:
+            x = spectral_features
 
-        # Fuse with raw waveform branch
-        if self.use_spectral_branch and raw_input is not None:
-            raw_features = self.raw_encoder(raw_input)  # (T, N, D)
-            x = self.fusion(x, raw_features)
+        # Temporal backbone
+        x = self.backbone(x)    # Transformer expects (T, N, D)
 
         # Attention refinement head
         if self.use_attention_head:
             x = self.attn_head(x)  # (T, N, D)
+
+        if self.pretraining_mode:
+            # Predict cluster probabilities for the pre-training task
+            logits = self.reconstruction_head(x) # (T, N, num_clusters)
+            return x, logits
 
         return x

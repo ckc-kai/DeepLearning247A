@@ -245,20 +245,35 @@ class SpecAugment:
         return x.movedim(-1, 0)
 
 @dataclass
-class DualBranchTransform:
-    """Clones the tensor for raw output, and applies spectral transforms for spectral output.
-    Returns a dictionary of {"raw": raw, "spectral": spectral}."""
-    spectral_transforms: Transform[torch.Tensor, torch.Tensor]
-
-    def __call__(self, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
-        # Standardize the raw waveform along the temporal dimension (dim=0)
-        # tensor is of shape (T, N, C) or (T, C)
-        raw = tensor.clone()
-        mean = raw.mean(dim=0, keepdim=True)
-        std = raw.std(dim=0, keepdim=True)
-        raw_normalized = (raw - mean) / (std + 1e-5)
-
+class MaskedSpectralTransform:
+    """
+    Applies random block masking over the temporal dimension of a spectrogram,
+    specifically designed for Masked Spectral Pre-training (SPECTRE).
+    
+    Returns a dictionary so the model knows which indices were masked in order
+    to apply the [MASK] token and calculate loss appropriately.
+    """
+    masking_ratio: float = 0.30
+    
+    def __call__(self, specgram: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            specgram: (T, N, bands, freq)
+            
+        Returns:
+            dict containing:
+                - 'spectral': The original unmasked spectrogram tensor. 
+                  (The masking happens via a learned token IN the model, not here).
+                - 'mask_indices': A boolean mask of shape (T, N) where True means 
+                  the frame should be replaced by the [MASK] token.
+        """
+        T = specgram.shape[0]
+        
+        # We want to mask roughly `masking_ratio` of the sequence.
+        # Create a boolean tensor of shape (T,)
+        mask_indices = torch.rand(T, device=specgram.device) < self.masking_ratio
+        
         return {
-            "raw": raw_normalized,
-            "spectral": self.spectral_transforms(tensor)
+            "spectral": specgram,
+            "mask_indices": mask_indices
         }

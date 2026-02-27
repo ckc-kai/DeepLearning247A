@@ -522,10 +522,13 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
         inputs = [sample[0] for sample in samples]  # [(T, ...)] or list of dicts
         targets = [sample[1] for sample in samples]  # [(T,)]
 
-        # Check if dual branch format
+
+        # Check if pre-training dictionary format (MaskedSpectralTransform)
         if isinstance(inputs[0], dict):
             input_batch = nn.utils.rnn.pad_sequence([inp["spectral"] for inp in inputs])
-            raw_batch = nn.utils.rnn.pad_sequence([inp["raw"] for inp in inputs])
+            
+            # Mask indices are booleans (T, N), we pad them with False
+            mask_batch = nn.utils.rnn.pad_sequence([inp["mask_indices"] for inp in inputs], padding_value=False)
             
             target_batch = nn.utils.rnn.pad_sequence(targets)
 
@@ -538,13 +541,13 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
 
             return {
                 "inputs": input_batch,
-                "raw_inputs": raw_batch,
+                "mask_indices": mask_batch,
                 "targets": target_batch,
                 "input_lengths": input_lengths,
                 "target_lengths": target_lengths,
             }
 
-        # Batch of inputs and targets padded along time
+        # Batch of standard inputs and targets padded along time
         input_batch = nn.utils.rnn.pad_sequence(inputs)  # (T, N, ...)
         target_batch = nn.utils.rnn.pad_sequence(targets)  # (T, N)
 
