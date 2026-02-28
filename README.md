@@ -82,6 +82,8 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc 
 
 ### Transformer + CyRoPE + MultiBandElectrodeMixer + Pretrain
 
+#### Pretrain
+
 | Metric   | DataLoader 0       |
 | -------- | ------------------ |
 | val/CER  | 15.573770523071289 |
@@ -98,8 +100,26 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc 
 | test/SER  | 9.766132354736328  |
 | test/loss | 0.5921993851661682 |
 
+#### Fine-tune
+
+| Metric   | DataLoader 0       |
+| -------- | ------------------ |
+| val/CER  | 14.421798706054688 |
+| val/DER  | 1.7501107454299927 |
+| val/IER  | 4.674346446990967  |
+| val/SER  | 7.997341632843018  |
+| val/loss | 0.5664355754852295 |
+
+| Metric    | DataLoader 0       |
+| --------- | ------------------ |
+| test/CER  | 16.370723724365234 |
+| test/DER  | 2.3603291511535645 |
+| test/IER  | 4.850584506988525  |
+| test/SER  | 9.159809112548828  |
+| test/loss | 0.6432779431343079 |
+
 ```shell
-PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc ++model.pretraining_mode=False ++checkpoint=/Users/kaichengchu/Desktop/ucla/247/DeepLearning247A/logs/2026-02-27/01-51-49/checkpoints/epoch_88-step_10680.ckpt
 ```
 
 ## License
