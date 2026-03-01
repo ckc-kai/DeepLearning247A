@@ -51,14 +51,44 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train user=single_user model=
 
 1. CyRoPE Positional Encoding on time + electrode position: learning consistent spatial relations, used in both MultibandElectrodeMixer and Transformer.
 2. MultiBandElectrodeMixer: Learning global spatial relationships with 4 attention heads with CyRope
-3. Transformer: a tightly constrained 2-layer Pre-LN Transformer with 8 attention heads, a feed-forward dimension of 1024, and 0.15 dropout
-4. Spectral Branch (currently set optional): parallel to raw waveform path, compute time-frequency representation and encode with a lightweight temporal encoder.
-5. Attention Refinement Head: fuse two branches and polish step
-6. Decoding with a character-level 6-gram language model, same as original paper.
+3. Self-supervised Pretraining: Use K-means to cluster the input data into 500 clusters, and mask 35% of the input data and training the model to predict the masked cluster labels.
+4. Transformer: a tightly constrained 2-layer Pre-LN Transformer with 8 attention heads, a feed-forward dimension of 1024, and 0.15 dropout
+5. Attention Refinement Head
+6. Fine-tuning on the pretraining model. We use a smaller learning rate for fine-tuning and smaller epochs.
+7. Decoding with a character-level 6-gram language model, same as original paper.
+
+## How to Run
+
+### Pretraining Setup
+
+- You need to define the number of clusters $k$ and the output path for the kmeans model.
+
+```shell
+python -m scripts.generate_spectre_clusters --k <k> --out <output_path>
+```
+
+### Pretraining
+
+- Set the `model.pretraining_mode` to `True` in `config/model/cyro2formers_ctc.yaml`.
+
+```shell
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train user=single_user model=cyro2formers_ctc ++model.pretraining_mode=True
+```
+
+### Fine-tuning
+
+- Set the `model.pretraining_mode` to `False` in `config/model/cyro2formers_ctc.yaml`.
+- Adjust the learning rate and number of epochs.
+
+```shell
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train user=single_user model=cyro2formers_ctc ++model.pretraining_mode=False ++checkpoint=<checkpoint_path>
+```
 
 ## Results
 
 ### Transformer + CyRoPE + MultiBandElectrodeMixer
+
+checkpoint file location: logs/2026-02-26/01-30-51/checkpoints/epoch=134-step=16200.ckpt
 
 | Metric   | DataLoader 0       |
 | -------- | ------------------ |
@@ -76,13 +106,11 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train user=single_user model=
 | test/SER  | 11.368557929992676 |
 | test/loss | 0.7223228812217712 |
 
-```shell
-PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc ++train=false ++checkpoint=./logs/2026-02-26/01-30-51/checkpoints/last.ckpt
-```
-
 ### Transformer + CyRoPE + MultiBandElectrodeMixer + Pretrain
 
 #### Pretrain
+
+checkpoint file location: logs/2026-02-27/01-51-49/checkpoints/epoch_88-step_10680.ckpt
 
 | Metric   | DataLoader 0       |
 | -------- | ------------------ |
@@ -102,6 +130,8 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc 
 
 #### Fine-tune
 
+checkpoint file location: logs/2026-02-27/10-07-07/checkpoints/epoch=57-step=6960.ckpt
+
 | Metric   | DataLoader 0       |
 | -------- | ------------------ |
 | val/CER  | 14.421798706054688 |
@@ -118,8 +148,52 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc 
 | test/SER  | 9.159809112548828  |
 | test/loss | 0.6432779431343079 |
 
+From here, we can see that the Our Transformer model with pretraining and fine-tuning outperforms the baseline CNN model and baseline Transformer model. We will follow some other researchers' idea to tune the hidden dimension and layer depth to further improve the performance. Specifically, we increase the FFN hidden dimension from 1024 to 2048 and the number of layers from 2 to 3.
+
+### Pretrain Results
+
+| Metric   | DataLoader 0       |
+| -------- | ------------------ |
+| val/CER  | 14.31103229522705  |
+| val/DER  | 2.6140894889831543 |
+| val/IER  | 2.724855899810791  |
+| val/SER  | 8.97198486328125   |
+| val/loss | 0.5199993848800659 |
+
+| Metric    | DataLoader 0       |
+| --------- | ------------------ |
+| test/CER  | 15.6561279296875   |
+| test/DER  | 2.7284538745880127 |
+| test/IER  | 3.161541700363159  |
+| test/SER  | 9.766132354736328  |
+| test/loss | 0.5835206508636475 |
+
+### Fine-tune Restuls:
+
+| Metric       | DataLoader 0       |
+| ------------ | ------------------ |
+| val/CER      | 14.133806228637695 |
+| val/DER      | 1.8387240171432495 |
+| val/IER      | 3.65529465675354   |
+| val/SER      | 8.639787673950195  |
+| val/ctc_loss | 0.5220286250114441 |
+| val/loss     | 0.5220286250114441 |
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 15.461238861083984 |
+| test/DER      | 1.8839324712753296 |
+| test/IER      | 4.37418794631958   |
+| test/SER      | 9.203118324279785  |
+| test/ctc_loss | 0.5856450200080872 |
+| test/loss     | 0.5856450200080872 |
+
+## Verify any checkpoint results:
+
+For testing without training, use the following command:
+
 ```shell
-PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc ++model.pretraining_mode=False ++checkpoint=/Users/kaichengchu/Desktop/ucla/247/DeepLearning247A/logs/2026-02-27/01-51-49/checkpoints/epoch_88-step_10680.ckpt
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -m emg2qwerty.train model=cyro2formers_ctc ++train=false ++checkpoint=<checkpoint_path>
 ```
 
 ## License

@@ -46,10 +46,14 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         train_transform: Transform[np.ndarray, torch.Tensor],
         val_transform: Transform[np.ndarray, torch.Tensor],
         test_transform: Transform[np.ndarray, torch.Tensor],
+        pretraining_mode: bool = False,
+        masking_ratio: float = 0.3,
     ) -> None:
         super().__init__()
 
         self.window_length = window_length
+        self.pretraining_mode = pretraining_mode
+        self.masking_ratio = masking_ratio
         self.padding = padding
 
         self.batch_size = batch_size
@@ -64,6 +68,18 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         self.test_transform = test_transform
 
     def setup(self, stage: str | None = None) -> None:
+        # Dynamically inject the spectral masking transform if pre-training is on
+        if self.pretraining_mode:
+            from emg2qwerty.transforms import MaskedSpectralTransform, Compose
+            if isinstance(self.train_transform, Compose):
+                if not any(isinstance(t, MaskedSpectralTransform) for t in self.train_transform.transforms):
+                    # Create a new Compose to safely append without mutating references
+                    new_transforms = list(self.train_transform.transforms)
+                    new_transforms.append(MaskedSpectralTransform(masking_ratio=self.masking_ratio))
+                    self.train_transform = Compose(new_transforms)
+            else:
+                self.train_transform = Compose([self.train_transform, MaskedSpectralTransform(masking_ratio=self.masking_ratio)])
+
         self.train_dataset = ConcatDataset(
             [
                 WindowedEMGDataset(
@@ -590,9 +606,9 @@ class CyRo2FormersCTCModule(pl.LightningModule):
             
             # Load the K-Means offline model lazily
             if not hasattr(self, "kmeans_model"):
-                kmeans_path = Path("data/spectre_kmeans_500.pkl")
+                kmeans_path = Path(f"data/spectre_kmeans_{self.num_clusters}.pkl")
                 if not kmeans_path.exists():
-                    raise FileNotFoundError("generate_spectre_clusters.py has not been run!")
+                    raise FileNotFoundError(f"generate_spectre_clusters.py has not been run for K={self.num_clusters}!")
                 with open(kmeans_path, "rb") as f:
                     self.kmeans_model = pickle.load(f)
             

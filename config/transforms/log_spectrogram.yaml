@@ -25,9 +25,6 @@ specaug:
   n_freq_masks: 2
   freq_mask_param: 4
 
-masked_spec:
-  _target_: emg2qwerty.transforms.MaskedSpectralTransform
-  masking_ratio: 0.30
 
 transforms:
   train:
@@ -36,7 +33,6 @@ transforms:
     - ${temporal_jitter}
     - ${logspec}
     - ${specaug}
-    - ${masked_spec}
 
   val:
     - ${to_tensor}
