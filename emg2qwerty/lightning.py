@@ -48,12 +48,16 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         test_transform: Transform[np.ndarray, torch.Tensor],
         pretraining_mode: bool = False,
         masking_ratio: float = 0.3,
+        use_span_masking: bool = True,
+        mask_length: int = 10,
     ) -> None:
         super().__init__()
 
         self.window_length = window_length
         self.pretraining_mode = pretraining_mode
         self.masking_ratio = masking_ratio
+        self.use_span_masking = use_span_masking
+        self.mask_length = mask_length
         self.padding = padding
 
         self.batch_size = batch_size
@@ -75,10 +79,21 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                 if not any(isinstance(t, MaskedSpectralTransform) for t in self.train_transform.transforms):
                     # Create a new Compose to safely append without mutating references
                     new_transforms = list(self.train_transform.transforms)
-                    new_transforms.append(MaskedSpectralTransform(masking_ratio=self.masking_ratio))
+                    new_transforms.append(MaskedSpectralTransform(
+                        masking_ratio=self.masking_ratio,
+                        use_span_masking=self.use_span_masking,
+                        mask_length=self.mask_length
+                    ))
                     self.train_transform = Compose(new_transforms)
             else:
-                self.train_transform = Compose([self.train_transform, MaskedSpectralTransform(masking_ratio=self.masking_ratio)])
+                self.train_transform = Compose([
+                    self.train_transform, 
+                    MaskedSpectralTransform(
+                        masking_ratio=self.masking_ratio,
+                        use_span_masking=self.use_span_masking,
+                        mask_length=self.mask_length
+                    )
+                ])
 
         self.train_dataset = ConcatDataset(
             [
@@ -471,12 +486,16 @@ class CyRo2FormersCTCModule(pl.LightningModule):
         # Spectral Pre-training
         pretraining_mode: bool = False,
         masking_ratio: float = 0.3,
+        use_span_masking: bool = True,
+        mask_length: int = 10,
         num_clusters: int = 500,
         # Spectral branch
         use_spectral_branch: bool = True,
         spectral_conv_channels: Sequence[int] = (128, 256, 256),
         spectral_kernel_size: int = 5,
         fusion_type: str = "gated",
+        # Fine-Tuning
+        freeze_backbone: bool = False,
         # Training
         optimizer: DictConfig = None,
         lr_scheduler: DictConfig = None,
@@ -534,6 +553,20 @@ class CyRo2FormersCTCModule(pl.LightningModule):
 
         self.pretraining_mode = pretraining_mode
         self.num_clusters = num_clusters
+        self.freeze_backbone = freeze_backbone
+
+        if self.freeze_backbone:
+            # Freeze frontend processors
+            for param in self.mlp_extractor.parameters():
+                param.requires_grad = False
+            for param in self.attention_mixer.parameters():
+                param.requires_grad = False
+            for param in self.frontend_proj.parameters():
+                param.requires_grad = False
+            
+            # Freeze the Transformer backbone within the encoder
+            for param in self.encoder.backbone.parameters():
+                param.requires_grad = False
 
         self.classifier = nn.Sequential(
             nn.Linear(backbone_d_model, charset().num_classes),
@@ -705,7 +738,11 @@ class CyRo2FormersCTCModule(pl.LightningModule):
         if hasattr(self.encoder, "raw_encoder") and self.encoder.raw_encoder is not None:
             raw_encoder_params = set(self.encoder.raw_encoder.parameters())
 
-        global_params = [p for p in self.parameters() if p not in raw_encoder_params]
+        # Only pass parameters that require a gradient (frozen backbone support)
+        global_params = [
+            p for p in self.parameters() 
+            if p not in raw_encoder_params and p.requires_grad
+        ]
         
         # 1D CNNs on raw signals have sharper gradients. Lower LR by 10x to prevent explosion
         param_groups = [

@@ -152,6 +152,8 @@ From here, we can see that the Our Transformer model with pretraining and fine-t
 
 ### Pretrain Results
 
+checkpoint file: logs/2026-02-27/22-41-30/hydra_configs/config.yaml
+
 | Metric   | DataLoader 0       |
 | -------- | ------------------ |
 | val/CER  | 14.31103229522705  |
@@ -170,6 +172,8 @@ From here, we can see that the Our Transformer model with pretraining and fine-t
 
 ### Fine-tune Restuls:
 
+checkpoint file: logs/2026-02-28/09-56-49/checkpoints/epoch=1-step=240.ckpt
+
 | Metric       | DataLoader 0       |
 | ------------ | ------------------ |
 | val/CER      | 14.133806228637695 |
@@ -187,6 +191,131 @@ From here, we can see that the Our Transformer model with pretraining and fine-t
 | test/SER      | 9.203118324279785  |
 | test/ctc_loss | 0.5856450200080872 |
 | test/loss     | 0.5856450200080872 |
+
+This improvement is not significant. I will propose the following changes:
+
+1. Decrease the value of K. A single user typing on a QWERTY keyboard is essentially producing combinations of ~30-40 distinct character intents. While the biomechanical transitions between keys create more unique states (co-articulations), 500 clusters might be forcing the K-means algorithm to separate data points based on random physiological noise, sensor shift, or minor velocity differences rather than meaningful gesture differences. If the pre-training task is forcing the model to predict structural noise, it limits fine-tuning performance.
+2. Back Transformer layers to 2, we prefer simple models.Paper suggest widen Feed Forward Network to 2048 and shallow layer to 1, I would also apply this to refinement head.
+3. I increase the dropout to control the widen feedforward layer.
+4. Try to use span masking instead of random masking, with length of 12.
+
+1 raw sample = 0.5 ms
+1 spectrogram frame with hope 16 = 16 _ 0.5 ms = 8 ms
+mask length = 12 frames = 12 _ 8 ms = 96 ms
+
+The input data is 2kHz, with hope 16 = 125 frames/second
+The data window length is 4 seconds = 500 frames
+
+## Results
+
+### Pretrain
+
+logs/2026-03-01/00-03-16/checkpoints/epoch_122-step_14760.ckpt
+
+### Validate
+
+| Metric       | DataLoader 0       |
+| ------------ | ------------------ |
+| val/CER      | 14.820558547973633 |
+| val/DER      | 1.5728843212127686 |
+| val/IER      | 5.737704753875732  |
+| val/SER      | 7.5099687576293945 |
+| val/ctc_loss | 0.5112477540969849 |
+| val/loss     | 0.5112477540969849 |
+
+### Test
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 17.10697364807129  |
+| test/DER      | 1.775660514831543  |
+| test/IER      | 6.561282157897949  |
+| test/SER      | 8.77003002166748   |
+| test/ctc_loss | 0.5857426524162292 |
+| test/loss     | 0.5857426524162292 |
+
+### Fine-tune
+
+logs/2026-03-01/09-32-07/checkpoints/epoch=2-step=360.ckpt
+
+### Validate
+
+| Metric       | DataLoader 0       |
+| ------------ | ------------------ |
+| val/CER      | 14.59902572631836  |
+| val/DER      | 1.7279574871063232 |
+| val/IER      | 5.560478687286377  |
+| val/SER      | 7.31058931350708   |
+| val/ctc_loss | 0.5436331629753113 |
+| val/loss     | 0.5436331629753113 |
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 16.82546615600586  |
+| test/DER      | 1.775660514831543  |
+| test/IER      | 6.2148118019104    |
+| test/SER      | 8.834993362426758  |
+| test/ctc_loss | 0.6329408884048462 |
+| test/loss     | 0.6329408884048462 |
+
+It seems that adding all these tricks does not help much.
+
+Further improvement:
+
+1. Back the refinement head to original settings. The paper suggests widen FFN to 2048 and shallow layer to 1 does not help in my architecture, probably because the I use refinement head as decoder. By squashing your Refinement Head to 1 layer but exploding its width to 2048, you created a shallow "memorization trap."
+2. Slightly increase the dropout. Training and validation accuracy is higher than test accuracy, which means the model is overfitting.
+
+Interesting finding here:
+The loss osciliate at early epochs and stops learning. There seems to be a mismatch between either lower the ffn hidden dimension and increase the dropout, or increase the model layer and increase the dropout.
+
+Choice of K:
+
+Two hands typing _ 6 characters _ 5 EMG pattern = 60 clusters
+
+Add some bias, small posture difference, transition: 60 \* 2 = 120 clusters
+
+## Results:
+
+### Pretrain
+
+Checkpoint: logs/2026-03-01/22-57-02/checkpoints/epoch=128-step=15480.ckpt
+| Metric | DataLoader 0 |
+| ------------ | ------------------ |
+| val/CER | 14.28887939453125 |
+| val/DER | 2.259636640548706 |
+| val/IER | 4.142667293548584 |
+| val/SER | 7.886575222015381 |
+| val/ctc_loss | 0.5020869374275208 |
+| val/loss | 0.5020869374275208 |
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 16.349069595336914 |
+| test/DER      | 2.230402708053589  |
+| test/IER      | 4.395842552185059  |
+| test/SER      | 9.722824096679688  |
+| test/ctc_loss | 0.5769004821777344 |
+| test/loss     | 0.5769004821777344 |
+
+### Fine-tune
+
+| Metric       | DataLoader 0       |
+| ------------ | ------------------ |
+| val/CER      | 14.266725540161133 |
+| val/DER      | 2.281790018081665  |
+| val/IER      | 4.098360538482666  |
+| val/SER      | 7.886575222015381  |
+| val/ctc_loss | 0.501772403717041  |
+| val/loss     | 0.501772403717041  |
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 16.370723724365234 |
+| test/DER      | 2.230402708053589  |
+| test/IER      | 4.352533340454102  |
+| test/SER      | 9.787786483764648  |
+| test/ctc_loss | 0.5757503509521484 |
+| test/loss     | 0.5757503509521484 |
 
 ## Verify any checkpoint results:
 

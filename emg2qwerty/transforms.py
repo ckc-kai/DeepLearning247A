@@ -254,6 +254,8 @@ class MaskedSpectralTransform:
     to apply the [MASK] token and calculate loss appropriately.
     """
     masking_ratio: float = 0.30
+    mask_length: int = 10
+    use_span_masking: bool = True
     
     def __call__(self, specgram: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -269,9 +271,23 @@ class MaskedSpectralTransform:
         """
         T = specgram.shape[0]
         
-        # We want to mask roughly `masking_ratio` of the sequence.
-        # Create a boolean tensor of shape (T,)
-        mask_indices = torch.rand(T, device=specgram.device) < self.masking_ratio
+        if self.use_span_masking:
+            mask_indices = torch.zeros(T, dtype=torch.bool, device=specgram.device)
+            
+            # Calculate number of masks to apply to achieve approx masking_ratio
+            # Each mask covers mask_length frames, but masks can overlap. 
+            num_masks = int(self.masking_ratio * T / self.mask_length)
+            
+            if num_masks > 0 and T > self.mask_length:
+                # Random starting indices for the masks
+                mask_starts = torch.randint(0, T - self.mask_length + 1, (num_masks,), device=specgram.device)
+                # Create spans
+                for start in mask_starts:
+                    mask_indices[start:start + self.mask_length] = True
+        else:
+            # We want to mask roughly `masking_ratio` of the sequence.
+            # Create a boolean tensor of shape (T,)
+            mask_indices = torch.rand(T, device=specgram.device) < self.masking_ratio
         
         return {
             "spectral": specgram,

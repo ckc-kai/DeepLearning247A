@@ -14,22 +14,29 @@ module:
   backbone_n_layers: 2       
   transformer_n_heads: 8
   transformer_dim_feedforward: 2048 
-  transformer_dropout: 0.25     
+  transformer_dropout: 0.15    
 
   # --- Attention Refinement ---
   use_attention_head: true
   attn_n_layers: 2
   attn_n_heads: 8
   attn_dim_feedforward: 1024
-  attn_dropout: 0.15
+  attn_dropout: 0.1
 
   # --- Spectral Pre-training ---
   pretraining_mode: false       # Toggle to true for pre-training, false for CTC
-  masking_ratio: 0.35
-  num_clusters: 500
+  masking_ratio: 0.15
+  num_clusters: 250
+  use_span_masking: false
+  mask_length: 8
+
+  # --- Fine-Tuning ---
+  freeze_backbone: false
 datamodule:
   _target_: emg2qwerty.lightning.WindowedEMGDataModule
   window_length: 8000        # 4 sec windows for 2kHz EMG
   padding: [1800, 200]       # 900ms past context, 100ms future context
   pretraining_mode: ${module.pretraining_mode}
   masking_ratio: ${module.masking_ratio}
+  use_span_masking: ${module.use_span_masking}
+  mask_length: ${module.mask_length}
