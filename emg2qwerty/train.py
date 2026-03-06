@@ -64,11 +64,18 @@ def main(config: DictConfig):
     )
     if config.checkpoint is not None:
         log.info(f"Loading module from checkpoint {config.checkpoint}")
-        module = module.load_from_checkpoint(
+        
+        # Extract the kwargs to override checkpoint hyperparameters
+        module_kwargs = dict(config.module)
+        module_kwargs.pop("_target_", None)
+        
+        module = module.__class__.load_from_checkpoint(
             config.checkpoint,
             optimizer=config.optimizer,
             lr_scheduler=config.lr_scheduler,
             decoder=config.decoder,
+            strict=False,
+            **module_kwargs
         )
 
     # Instantiate LightningDataModule

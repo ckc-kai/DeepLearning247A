@@ -10,8 +10,8 @@ module:
   use_cyrope: true
 
   # --- Backbone ---
-  backbone_d_model: 768         # 2 bands * 384
-  backbone_n_layers: 2       
+  backbone_d_model: 768         
+  backbone_n_layers: 3       
   transformer_n_heads: 8
   transformer_dim_feedforward: 2048 
   transformer_dropout: 0.15    
@@ -26,9 +26,9 @@ module:
   # --- Spectral Pre-training ---
   pretraining_mode: false       # Toggle to true for pre-training, false for CTC
   masking_ratio: 0.15
-  num_clusters: 250
+  num_clusters: 300
   use_span_masking: false
-  mask_length: 8
+  mask_length: 16
 
   # --- Fine-Tuning ---
   freeze_backbone: false

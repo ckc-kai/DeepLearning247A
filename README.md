@@ -128,31 +128,11 @@ checkpoint file location: logs/2026-02-27/01-51-49/checkpoints/epoch_88-step_106
 | test/SER  | 9.766132354736328  |
 | test/loss | 0.5921993851661682 |
 
-#### Fine-tune
-
-checkpoint file location: logs/2026-02-27/10-07-07/checkpoints/epoch=57-step=6960.ckpt
-
-| Metric   | DataLoader 0       |
-| -------- | ------------------ |
-| val/CER  | 14.421798706054688 |
-| val/DER  | 1.7501107454299927 |
-| val/IER  | 4.674346446990967  |
-| val/SER  | 7.997341632843018  |
-| val/loss | 0.5664355754852295 |
-
-| Metric    | DataLoader 0       |
-| --------- | ------------------ |
-| test/CER  | 16.370723724365234 |
-| test/DER  | 2.3603291511535645 |
-| test/IER  | 4.850584506988525  |
-| test/SER  | 9.159809112548828  |
-| test/loss | 0.6432779431343079 |
-
 From here, we can see that the Our Transformer model with pretraining and fine-tuning outperforms the baseline CNN model and baseline Transformer model. We will follow some other researchers' idea to tune the hidden dimension and layer depth to further improve the performance. Specifically, we increase the FFN hidden dimension from 1024 to 2048 and the number of layers from 2 to 3.
 
 ### Pretrain Results
 
-checkpoint file: logs/2026-02-27/22-41-30/hydra_configs/config.yaml
+checkpoint file: logs/2026-02-27/22-41-30/checkpoints/epoch_118-step_14280.ckpt
 
 | Metric   | DataLoader 0       |
 | -------- | ------------------ |
@@ -170,29 +150,7 @@ checkpoint file: logs/2026-02-27/22-41-30/hydra_configs/config.yaml
 | test/SER  | 9.766132354736328  |
 | test/loss | 0.5835206508636475 |
 
-### Fine-tune Restuls:
-
-checkpoint file: logs/2026-02-28/09-56-49/checkpoints/epoch=1-step=240.ckpt
-
-| Metric       | DataLoader 0       |
-| ------------ | ------------------ |
-| val/CER      | 14.133806228637695 |
-| val/DER      | 1.8387240171432495 |
-| val/IER      | 3.65529465675354   |
-| val/SER      | 8.639787673950195  |
-| val/ctc_loss | 0.5220286250114441 |
-| val/loss     | 0.5220286250114441 |
-
-| Metric        | DataLoader 0       |
-| ------------- | ------------------ |
-| test/CER      | 15.461238861083984 |
-| test/DER      | 1.8839324712753296 |
-| test/IER      | 4.37418794631958   |
-| test/SER      | 9.203118324279785  |
-| test/ctc_loss | 0.5856450200080872 |
-| test/loss     | 0.5856450200080872 |
-
-This improvement is not significant. I will propose the following changes:
+There is improvement in pretraining. I will propose the following changes:
 
 1. Decrease the value of K. A single user typing on a QWERTY keyboard is essentially producing combinations of ~30-40 distinct character intents. While the biomechanical transitions between keys create more unique states (co-articulations), 500 clusters might be forcing the K-means algorithm to separate data points based on random physiological noise, sensor shift, or minor velocity differences rather than meaningful gesture differences. If the pre-training task is forcing the model to predict structural noise, it limits fine-tuning performance.
 2. Back Transformer layers to 2, we prefer simple models.Paper suggest widen Feed Forward Network to 2048 and shallow layer to 1, I would also apply this to refinement head.
@@ -234,30 +192,6 @@ logs/2026-03-01/00-03-16/checkpoints/epoch_122-step_14760.ckpt
 | test/ctc_loss | 0.5857426524162292 |
 | test/loss     | 0.5857426524162292 |
 
-### Fine-tune
-
-logs/2026-03-01/09-32-07/checkpoints/epoch=2-step=360.ckpt
-
-### Validate
-
-| Metric       | DataLoader 0       |
-| ------------ | ------------------ |
-| val/CER      | 14.59902572631836  |
-| val/DER      | 1.7279574871063232 |
-| val/IER      | 5.560478687286377  |
-| val/SER      | 7.31058931350708   |
-| val/ctc_loss | 0.5436331629753113 |
-| val/loss     | 0.5436331629753113 |
-
-| Metric        | DataLoader 0       |
-| ------------- | ------------------ |
-| test/CER      | 16.82546615600586  |
-| test/DER      | 1.775660514831543  |
-| test/IER      | 6.2148118019104    |
-| test/SER      | 8.834993362426758  |
-| test/ctc_loss | 0.6329408884048462 |
-| test/loss     | 0.6329408884048462 |
-
 It seems that adding all these tricks does not help much.
 
 Further improvement:
@@ -267,12 +201,6 @@ Further improvement:
 
 Interesting finding here:
 The loss osciliate at early epochs and stops learning. There seems to be a mismatch between either lower the ffn hidden dimension and increase the dropout, or increase the model layer and increase the dropout.
-
-Choice of K:
-
-Two hands typing _ 6 characters _ 5 EMG pattern = 60 clusters
-
-Add some bias, small posture difference, transition: 60 \* 2 = 120 clusters
 
 ## Results:
 
@@ -297,25 +225,113 @@ Checkpoint: logs/2026-03-01/22-57-02/checkpoints/epoch=128-step=15480.ckpt
 | test/ctc_loss | 0.5769004821777344 |
 | test/loss     | 0.5769004821777344 |
 
-### Fine-tune
+### Results
+
+The following results are using 2 layer backbone with 2048 ffn hidden layer and 0.15 dropout. and 2 layer refinement head with 1024 ffn hidden layer and 0.10 dropout. Additionally, span masking with length 16 and 500 clusters is applied.
+
+Span_masking + wide ffn works better than random masking + moderate ffn. However, the performance is still not as good as the 3 layer random masking architecture, with a little 0.3 in test CER.
+
+## Pretrain
+
+Checkpoint: logs/2026-03-03/01-22-14/checkpoints/epoch=123-step=14880.ckpt
 
 | Metric       | DataLoader 0       |
 | ------------ | ------------------ |
-| val/CER      | 14.266725540161133 |
-| val/DER      | 2.281790018081665  |
-| val/IER      | 4.098360538482666  |
-| val/SER      | 7.886575222015381  |
-| val/ctc_loss | 0.501772403717041  |
-| val/loss     | 0.501772403717041  |
+| val/CER      | 14.178112983703613 |
+| val/DER      | 2.3925564289093018 |
+| val/IER      | 3.65529465675354   |
+| val/SER      | 8.130261421203613  |
+| val/ctc_loss | 0.5071715116500854 |
+| val/loss     | 0.5071715116500854 |
 
 | Metric        | DataLoader 0       |
 | ------------- | ------------------ |
-| test/CER      | 16.370723724365234 |
-| test/DER      | 2.230402708053589  |
-| test/IER      | 4.352533340454102  |
-| test/SER      | 9.787786483764648  |
-| test/ctc_loss | 0.5757503509521484 |
-| test/loss     | 0.5757503509521484 |
+| test/CER      | 15.872672080993652 |
+| test/DER      | 2.338674783706665  |
+| test/IER      | 4.157643795013428  |
+| test/SER      | 9.37635326385498   |
+| test/ctc_loss | 0.5528315901756287 |
+| test/loss     | 0.5528315901756287 |
+
+Changes:
+
+1. dimensionality reduce from MultiBandElectrodeMixer to Transformer backbone, 768 -> 256
+2. refinement head ffn hidden layer from 1024 -> 512
+3. num_clusters from 500 -> 300
+
+## Results
+
+### Pretrain
+
+Checkpoint file: logs/2026-03-04/01-54-01/checkpoints/epoch=116-step=14040.ckpt
+
+| Metric       | DataLoader 0       |
+| ------------ | ------------------ |
+| val/CER      | 25.786441802978516 |
+| val/DER      | 1.9273371696472168 |
+| val/IER      | 12.339388847351074 |
+| val/SER      | 11.519716262817383 |
+| val/ctc_loss | 0.7541974782943726 |
+| val/loss     | 0.7541974782943726 |
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 25.7470760345459   |
+| test/DER      | 2.18709397315979   |
+| test/IER      | 9.809441566467285  |
+| test/SER      | 13.750541687011719 |
+| test/ctc_loss | 0.7633078098297119 |
+| test/loss     | 0.7633078098297119 |
+
+The dimension reduction in ffn hidden layer from 1024 -> 512, backbone hidden dimension layer from 768 -> 256 worsen the performance.
+
+## Result
+
+### Pretrain
+
+Checkpoint file: logs/2026-03-05/09-40-10/checkpoints/epoch=123-step=14880.ckpt
+
+| Metric       | DataLoader 0       |
+| ------------ | ------------------ |
+| val/CER      | 14.510412216186523 |
+| val/DER      | 1.8830305337905884 |
+| val/IER      | 3.4780681133270264 |
+| val/SER      | 9.149312973022461  |
+| val/ctc_loss | 0.5020440816879272 |
+| val/loss     | 0.5020440816879272 |
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 16.262451171875    |
+| test/DER      | 2.381983518600464  |
+| test/IER      | 3.8328280448913574 |
+| test/SER      | 10.047639846801758 |
+| test/ctc_loss | 0.5392957925796509 |
+| test/loss     | 0.5392957925796509 |
+
+## Fine-tune Stage
+
+Pick the best pre-train model and perform fine-tune. The best pre-train model is logs/2026-02-27/22-41-30/checkpoints/epoch_118-step_14280.ckpt, which consists of 3 layer transformer backbone with 2048 hidden dimension and 0.15 dropout, and 2 layer refinement head with 1024 hidden dimension and 0.10 dropout. Additionally, random masking ratio of 0.3 and cluster=500 is applied.
+
+### Results
+
+| Metric       | DataLoader 0       |
+| ------------ | ------------------ |
+| val/CER      | 14.155959129333496 |
+| val/DER      | 2.0159504413604736 |
+| val/IER      | 3.5002214908599854 |
+| val/SER      | 8.639787673950195  |
+| val/ctc_loss | 0.5205371975898743 |
+| val/loss     | 0.5205371975898743 |
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 15.179731369018555 |
+| test/DER      | 1.9272412061691284 |
+| test/IER      | 3.9411001205444336 |
+| test/SER      | 9.311389923095703  |
+| test/ctc_loss | 0.5838025212287903 |
+| test/loss     | 0.5838025212287903 |
 
 ## Verify any checkpoint results:
 
