@@ -229,35 +229,34 @@ Checkpoint: logs/2026-03-01/22-57-02/checkpoints/epoch=128-step=15480.ckpt
 
 The following results are using 2 layer backbone with 2048 ffn hidden layer and 0.15 dropout. and 2 layer refinement head with 1024 ffn hidden layer and 0.10 dropout. Additionally, span masking with length 16 and 500 clusters is applied.
 
-Span_masking + wide ffn works better than random masking + moderate ffn. However, the performance is still not as good as the 3 layer random masking architecture, with a little 0.3 in test CER.
+Span_masking + wide ffn theoretically works better than random masking + moderate ffn. However, the performance is still not as good as the 3 layer random masking architecture, with a little 0.3 in test CER.
 
 ## Pretrain
 
-Checkpoint: logs/2026-03-03/01-22-14/checkpoints/epoch=123-step=14880.ckpt
+Checkpoint: logs/2026-03-03/01-22-14/checkpoints/epoch_123-step_14880.ckpt
 
 | Metric       | DataLoader 0       |
 | ------------ | ------------------ |
-| val/CER      | 14.178112983703613 |
-| val/DER      | 2.3925564289093018 |
+| val/CER      | 14.665485382080078 |
+| val/DER      | 2.4590163230895996 |
 | val/IER      | 3.65529465675354   |
-| val/SER      | 8.130261421203613  |
-| val/ctc_loss | 0.5071715116500854 |
-| val/loss     | 0.5071715116500854 |
+| val/SER      | 8.55117416381836   |
+| val/ctc_loss | 0.5199381113052368 |
+| val/loss     | 0.5199381113052368 |
 
 | Metric        | DataLoader 0       |
 | ------------- | ------------------ |
-| test/CER      | 15.872672080993652 |
-| test/DER      | 2.338674783706665  |
-| test/IER      | 4.157643795013428  |
-| test/SER      | 9.37635326385498   |
-| test/ctc_loss | 0.5528315901756287 |
-| test/loss     | 0.5528315901756287 |
+| test/CER      | 15.829363822937012 |
+| test/DER      | 2.4036378860473633 |
+| test/IER      | 4.309224605560303  |
+| test/SER      | 9.116500854492188  |
+| test/ctc_loss | 0.5543370246887207 |
+| test/loss     | 0.5543370246887207 |
 
 Changes:
 
-1. dimensionality reduce from MultiBandElectrodeMixer to Transformer backbone, 768 -> 256
-2. refinement head ffn hidden layer from 1024 -> 512
-3. num_clusters from 500 -> 300
+1. Increase the span mask length from 8 to 16
+2. Increase the numnum_clusters from 250 to 500
 
 ## Results
 
@@ -283,7 +282,10 @@ Checkpoint file: logs/2026-03-04/01-54-01/checkpoints/epoch=116-step=14040.ckpt
 | test/ctc_loss | 0.7633078098297119 |
 | test/loss     | 0.7633078098297119 |
 
-The dimension reduction in ffn hidden layer from 1024 -> 512, backbone hidden dimension layer from 768 -> 256 worsen the performance.
+1. dimensionality reduce from MultiBandElectrodeMixer to Transformer backbone, 768 -> 256
+2. refinement head ffn hidden layer from 1024 -> 512
+3. num_clusters from 500 -> 300
+   The dimension reduction in ffn hidden layer from 1024 -> 512, backbone hidden dimension layer from 768 -> 256 worsen the performance.
 
 ## Result
 
@@ -332,6 +334,26 @@ Pick the best pre-train model and perform fine-tune. The best pre-train model is
 | test/SER      | 9.311389923095703  |
 | test/ctc_loss | 0.5838025212287903 |
 | test/loss     | 0.5838025212287903 |
+
+The second top architecture is checkpoint file: logs/2026-03-03/01-22-14/checkpoints/epoch_123-step_14880.ckpt. It has test CER of 15.829363822937012, which is 0.173 worse than the best architecture,15.6561279296875. This architecture uses 2 layer transformer backbone with 2048 hidden dimension and 0.15 dropout, and 2 layer refinement head with 1024 hidden dimension and 0.10 dropout. Additionally, random masking ratio of 0.15 and cluster=500 is applied.
+
+| Metric       | DataLoader 0       |
+| ------------ | ------------------ |
+| val/CER      | 13.956579208374023 |
+| val/DER      | 2.1267168521881104 |
+| val/IER      | 3.8768277168273926 |
+| val/SER      | 7.9530348777771    |
+| val/ctc_loss | 0.5138890147209167 |
+| val/loss     | 0.5138890147209167 |
+
+| Metric        | DataLoader 0       |
+| ------------- | ------------------ |
+| test/CER      | 16.045907974243164 |
+| test/DER      | 2.2520570755004883 |
+| test/IER      | 4.504114151000977  |
+| test/SER      | 9.289735794067383  |
+| test/ctc_loss | 0.5525649785995483 |
+| test/loss     | 0.5525649785995483 |
 
 ## Verify any checkpoint results:
 
