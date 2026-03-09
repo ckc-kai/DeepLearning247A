@@ -291,7 +291,7 @@ Checkpoint file: logs/2026-03-04/01-54-01/checkpoints/epoch=116-step=14040.ckpt
 
 ### Pretrain
 
-Checkpoint file: logs/2026-03-05/09-40-10/checkpoints/epoch=123-step=14880.ckpt
+Checkpoint file: logs/2026-03-05/23-01-29/checkpoints/epoch=7-step=960.ckpt
 
 | Metric       | DataLoader 0       |
 | ------------ | ------------------ |
@@ -317,6 +317,8 @@ Pick the best pre-train model and perform fine-tune. The best pre-train model is
 
 ### Results
 
+Checkpoint file: logs/2026-03-05/23-01-29/checkpoints/epoch=7-step=960.ckpt
+
 | Metric       | DataLoader 0       |
 | ------------ | ------------------ |
 | val/CER      | 14.155959129333496 |
@@ -337,6 +339,8 @@ Pick the best pre-train model and perform fine-tune. The best pre-train model is
 
 The second top architecture is checkpoint file: logs/2026-03-03/01-22-14/checkpoints/epoch_123-step_14880.ckpt. It has test CER of 15.829363822937012, which is 0.173 worse than the best architecture,15.6561279296875. This architecture uses 2 layer transformer backbone with 2048 hidden dimension and 0.15 dropout, and 2 layer refinement head with 1024 hidden dimension and 0.10 dropout. Additionally, random masking ratio of 0.15 and cluster=500 is applied.
 
+checkpoint file: logs/2026-03-06/22-12-23/checkpoints/epoch_12-step_1560.ckpt
+
 | Metric       | DataLoader 0       |
 | ------------ | ------------------ |
 | val/CER      | 13.956579208374023 |
@@ -354,6 +358,72 @@ The second top architecture is checkpoint file: logs/2026-03-03/01-22-14/checkpo
 | test/SER      | 9.289735794067383  |
 | test/ctc_loss | 0.5525649785995483 |
 | test/loss     | 0.5525649785995483 |
+
+Use the best models to perform beam search decoding.
+
+## Best Pretrained + CTC Beam Search Decoding
+
+│ val/CER │ 8.81701374053955 │
+│ val/DER │ 2.171023368835449 │
+│ val/IER │ 2.0602569580078125 │
+│ val/SER │ 4.585733413696289 │
+│ val/ctc_loss │ 0.5199993848800659 │
+│ val/loss │ 0.5199993848800659 │
+
+│ test/CER │ 10.112603187561035 │
+│ test/DER │ 2.295366048812866 │
+│ test/IER │ 2.7284538745880127 │
+│ test/SER │ 5.088782787322998 │
+│ test/ctc_loss │ 0.5835206508636475 │
+│ test/loss │ 0.5835206508636475 │
+
+## Second Best Pretrained + CTC Beam Search Decoding
+
+│ val/CER │ 8.861320495605469 │
+│ val/DER │ 2.215330123901367 │
+│ val/IER │ 2.370403289794922 │
+│ val/SER │ 4.27558708190918 │
+│ val/ctc_loss │ 0.5199381113052368 │
+│ val/loss │ 0.5199381113052368 │
+
+│ test/CER │ 10.26418399810791 │
+│ test/DER │ 2.2087483406066895 │
+│ test/IER │ 3.5296664237976074 │
+│ test/SER │ 4.525768756866455 │
+│ test/ctc_loss │ 0.5543370246887207 │
+│ test/loss │ 0.5543370246887207 │
+
+## Best Fine-tune + CTC Beam Search Decoding
+
+│ val/CER │ 9.304386138916016 │
+│ val/DER │ 1.9937970638275146 │
+│ val/IER │ 2.5697829723358154 │
+│ val/SER │ 4.740806579589844 │
+│ val/ctc_loss │ 0.5205371975898743 │
+│ val/loss │ 0.5205371975898743 │
+
+│ test/CER │ 10.220874786376953 │
+│ test/DER │ 2.078821897506714 │
+│ test/IER │ 3.248159408569336 │
+│ test/SER │ 4.893893241882324 │
+│ test/ctc_loss │ 0.5838025212287903 │
+│ test/loss │ 0.5838025212287903 │
+
+## Second Best Fine-tune + CTC Beam Search Decoding
+
+│ val/CER │ 8.79486083984375 │
+│ val/DER │ 2.0602569580078125 │
+│ val/IER │ 2.5033230781555176 │
+│ val/SER │ 4.231280326843262 │
+│ val/ctc_loss │ 0.5138890147209167 │
+│ val/loss │ 0.5138890147209167 │
+
+│ test/CER │ 10.0043306350708 │
+│ test/DER │ 2.122130870819092 │
+│ test/IER │ 3.4863576889038086 │
+│ test/SER │ 4.395842552185059 │
+│ test/ctc_loss │ 0.5525649785995483 │
+│ test/loss │ 0.5525649785995483 │
 
 ## Verify any checkpoint results:
 
