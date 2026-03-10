@@ -86,20 +86,40 @@ def main(config: DictConfig):
         _convert_="object",
     )
 
+    # Setup datamodule to build datasets, then log sizes
+    datamodule.setup()
+    train_size = len(datamodule.train_dataset)
+    val_size = len(datamodule.val_dataset)
+    steps_per_epoch = (train_size + config.batch_size - 1) // config.batch_size
+    log.info(
+        f"Train samples: {train_size}, Val samples: {val_size}, "
+        f"Steps per epoch: {steps_per_epoch}"
+    )
+
     # Instantiate callbacks
     callback_configs = config.get("callbacks", [])
     callbacks = [instantiate(cfg) for cfg in callback_configs]
 
+    trainer_kwargs = OmegaConf.to_container(config.trainer, resolve=True)
+    logger_config = config.trainer.get("logger")
+    if logger_config is not None and not isinstance(logger_config, bool):
+        trainer_kwargs["logger"] = instantiate(logger_config)
+
     # Initialize trainer
     trainer = pl.Trainer(
-        **config.trainer,
+        **trainer_kwargs,
         callbacks=callbacks,
     )
 
     if config.train:
-        # Check if a past checkpoint exists to resume training from
-        checkpoint_dir = Path.cwd().joinpath("checkpoints")
-        resume_from_checkpoint = utils.get_last_checkpoint(checkpoint_dir)
+        # Allow an explicit resume checkpoint so experiments can continue from
+        # a known state even when callback versioning renames last.ckpt.
+        resume_from_checkpoint = config.get("resume_checkpoint")
+        if resume_from_checkpoint is not None:
+            resume_from_checkpoint = Path(resume_from_checkpoint)
+        else:
+            checkpoint_dir = Path.cwd().joinpath("checkpoints")
+            resume_from_checkpoint = utils.get_last_checkpoint(checkpoint_dir)
         if resume_from_checkpoint is not None:
             log.info(f"Resuming training from checkpoint {resume_from_checkpoint}")
 

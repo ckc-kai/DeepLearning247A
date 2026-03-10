@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -278,3 +279,273 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+
+# -----------------------------------------------------------------------------
+# Conformer (Convolution + Transformer) for ConformerCTCModule
+# -----------------------------------------------------------------------------
+
+
+def lengths_to_padding_mask(
+    lengths: torch.Tensor,
+    max_len: int | None = None,
+) -> torch.Tensor:
+    """Build a key-padding mask of shape (N, T) from per-sample lengths."""
+
+    if max_len is None:
+        max_len = int(lengths.max().item())
+    steps = torch.arange(max_len, device=lengths.device)
+    return steps.unsqueeze(0) >= lengths.unsqueeze(1)
+
+
+def apply_padding_mask(
+    x: torch.Tensor,
+    padding_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Zero out padded timesteps for time-first tensors shaped as (T, N, D)."""
+
+    if padding_mask is None:
+        return x
+    return x.masked_fill(padding_mask.T.unsqueeze(-1), 0.0)
+
+
+class ConformerFeedForward(nn.Module):
+    """Half-step feed-forward in Conformer: Linear -> Swish -> Dropout -> Linear -> Dropout."""
+
+    def __init__(self, d_model: int, expansion: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_model * expansion)
+        self.activation = nn.SiLU()
+        self.linear2 = nn.Linear(d_model * expansion, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return self.dropout(x)
+
+
+class ConformerConv(nn.Module):
+    """Depthwise conv + pointwise in Conformer. Input (T, N, D) -> (T, N, D)."""
+
+    def __init__(self, d_model: int, kernel_size: int = 31) -> None:
+        super().__init__()
+        assert kernel_size % 2 == 1
+        self.padding = (kernel_size - 1) // 2
+        self.depthwise = nn.Conv1d(d_model, d_model, kernel_size, padding=self.padding, groups=d_model)
+        self.pointwise = nn.Conv1d(d_model, d_model, 1)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # (T, N, D) -> (N, D, T)
+        x = apply_padding_mask(x, padding_mask)
+        x = x.permute(1, 2, 0)
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = x.permute(2, 0, 1)  # (T, N, D)
+        x = self.layer_norm(x)
+        return apply_padding_mask(x, padding_mask)
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for time-first inputs (T, N, D)."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 8192) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer("pe", self._build_pe(max_len))
+
+    def _build_pe(self, max_len: int) -> torch.Tensor:
+        position = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / self.d_model)
+        )
+        pe = torch.zeros(max_len, 1, self.d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        return pe
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.shape[0]
+        if T > self.pe.shape[0]:
+            self.pe = self._build_pe(T).to(device=x.device)
+        return self.dropout(x + self.pe[:T].to(dtype=x.dtype))
+
+
+class TemporalSubsampling1d(nn.Module):
+    """Lightweight 1D conv subsampling for time-first inputs (T, N, D)."""
+
+    def __init__(
+        self,
+        d_model: int,
+        stride: int = 1,
+        kernel_size: int = 3,
+    ) -> None:
+        super().__init__()
+        assert stride >= 1
+        assert kernel_size % 2 == 1
+        self.stride = stride
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        self.conv = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=self.padding,
+        )
+        self.activation = nn.SiLU()
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.stride == 1:
+            return x
+        x = x.permute(1, 2, 0)  # (N, D, T)
+        x = self.conv(x)
+        x = self.activation(x)
+        x = x.permute(2, 0, 1)  # (T', N, D)
+        return self.layer_norm(x)
+
+    def output_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        if self.stride == 1:
+            return lengths
+        return ((lengths + 2 * self.padding - self.kernel_size) // self.stride) + 1
+
+
+class ConformerBlock(nn.Module):
+    """Single Conformer block: FFN -> MHSA -> Conv -> FFN with half-step residuals."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int = 4,
+        ffn_expansion: int = 4,
+        conv_kernel_size: int = 31,
+        dropout: float = 0.1,
+        attention_window: int = 0,
+    ) -> None:
+        super().__init__()
+        self.attention_window = attention_window
+        self.ffn1 = ConformerFeedForward(d_model, expansion=ffn_expansion, dropout=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=False
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.conv = ConformerConv(d_model, kernel_size=conv_kernel_size)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.ffn2 = ConformerFeedForward(d_model, expansion=ffn_expansion, dropout=dropout)
+        self.norm4 = nn.LayerNorm(d_model)
+
+    def _attention_mask(self, T: int, device: torch.device) -> torch.Tensor | None:
+        if self.attention_window <= 0:
+            return None
+        # Full-session test sequences can be very long; avoid allocating a dense
+        # T x T mask in that case and fall back to unmasked attention.
+        if T > 4096:
+            return None
+        idx = torch.arange(T, device=device)
+        distance = (idx[:, None] - idx[None, :]).abs()
+        return distance > self.attention_window
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # (T, N, D)
+        x = apply_padding_mask(x, padding_mask)
+        x = self.norm1(x + 0.5 * self.ffn1(x))
+        x = apply_padding_mask(x, padding_mask)
+        attn_mask = self._attention_mask(x.shape[0], x.device)
+        attn_out, _ = self.self_attn(
+            x,
+            x,
+            x,
+            attn_mask=attn_mask,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )
+        x = self.norm2(x + attn_out)
+        x = apply_padding_mask(x, padding_mask)
+        x = self.norm3(x + self.conv(x, padding_mask=padding_mask))
+        x = apply_padding_mask(x, padding_mask)
+        x = self.norm4(x + 0.5 * self.ffn2(x))
+        return apply_padding_mask(x, padding_mask)
+
+
+class ConformerEncoder(nn.Module):
+    """Stack of ConformerBlock with optional temporal subsampling."""
+
+    def __init__(
+        self,
+        num_features: int,
+        num_layers: int = 12,
+        n_heads: int = 4,
+        ffn_expansion: int = 4,
+        conv_kernel_size: int = 31,
+        dropout: float = 0.1,
+        time_reduction_stride: int = 1,
+        time_reduction_kernel_size: int = 3,
+        attention_window: int = 0,
+    ) -> None:
+        super().__init__()
+        self.subsampling = TemporalSubsampling1d(
+            d_model=num_features,
+            stride=time_reduction_stride,
+            kernel_size=time_reduction_kernel_size,
+        )
+        self.pos_encoding = SinusoidalPositionalEncoding(
+            num_features, dropout=dropout
+        )
+        self.layers = nn.ModuleList(
+            [
+                ConformerBlock(
+                    d_model=num_features,
+                    n_heads=n_heads,
+                    ffn_expansion=ffn_expansion,
+                    conv_kernel_size=conv_kernel_size,
+                    dropout=dropout,
+                    attention_window=attention_window,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+        intermediate_layer: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        x = self.subsampling(inputs)  # (T', N, num_features)
+        padding_mask = None
+        if lengths is not None:
+            output_lengths = self.output_lengths(lengths).clamp_max(x.shape[0])
+            padding_mask = lengths_to_padding_mask(output_lengths, max_len=x.shape[0])
+        x = self.pos_encoding(x)
+        x = apply_padding_mask(x, padding_mask)
+        intermediate_output = None
+        for idx, layer in enumerate(self.layers, start=1):
+            x = layer(x, padding_mask=padding_mask)
+            if intermediate_layer is not None and idx == intermediate_layer:
+                intermediate_output = apply_padding_mask(x, padding_mask)
+
+        x = apply_padding_mask(x, padding_mask)
+
+        if intermediate_output is None:
+            return x
+        return x, intermediate_output
+
+    def output_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        return self.subsampling.output_lengths(lengths)
+
+
