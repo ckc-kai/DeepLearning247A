@@ -135,6 +135,21 @@ class CharacterSet:
         return len(self) + 1
 
     @property
+    def sos_class(self) -> int:
+        """Categorical label for start-of-sequence token (decoder)."""
+        return len(self) + 1
+
+    @property
+    def eos_class(self) -> int:
+        """Categorical label for end-of-sequence token (decoder)."""
+        return len(self) + 2
+
+    @property
+    def num_classes_seq2seq(self) -> int:
+        """Number of classes for encoder-decoder: chars + blank + sos + eos."""
+        return len(self) + 3
+
+    @property
     def allowed_keys(self) -> tuple[KeyChar, ...]:
         """Sequence of allowed keys, order respected."""
         return tuple(self._key_to_unicode.keys())

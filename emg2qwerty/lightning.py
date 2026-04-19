@@ -29,6 +29,7 @@ from emg2qwerty.modules import (
     CNNCustome,
     MultiBandElectrodeMixer,
     CyRo2FormersEncoder,
+    TransformerDecoderModule,
 )
 from emg2qwerty.transforms import Transform
 
@@ -50,6 +51,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         masking_ratio: float = 0.3,
         use_span_masking: bool = True,
         mask_length: int = 10,
+        seq2seq_mode: bool = False,
     ) -> None:
         super().__init__()
 
@@ -66,6 +68,8 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         self.train_sessions = train_sessions
         self.val_sessions = val_sessions
         self.test_sessions = test_sessions
+
+        self.seq2seq_mode = seq2seq_mode
 
         self.train_transform = train_transform
         self.val_transform = val_transform
@@ -136,13 +140,19 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             ]
         )
 
+    @property
+    def _collate_fn(self):
+        if self.seq2seq_mode:
+            return WindowedEMGDataset.collate_seq2seq
+        return WindowedEMGDataset.collate
+
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            collate_fn=WindowedEMGDataset.collate,
+            collate_fn=self._collate_fn,
             pin_memory=True,
             persistent_workers=True,
         )
@@ -153,7 +163,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=WindowedEMGDataset.collate,
+            collate_fn=self._collate_fn,
             pin_memory=True,
             persistent_workers=True,
         )
@@ -171,7 +181,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=WindowedEMGDataset.collate,
+            collate_fn=self._collate_fn,
             pin_memory=True,
             persistent_workers=True,
         )
@@ -760,6 +770,415 @@ class CyRo2FormersCTCModule(pl.LightningModule):
         lr_scheduler = hydra.utils.instantiate(self.hparams.lr_scheduler, scheduler=scheduler)
         
         import omegaconf
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": omegaconf.OmegaConf.to_container(lr_scheduler),
+        }
+
+
+class CyRo2FormersSeq2SeqModule(pl.LightningModule):
+    """Encoder-decoder CyRo2Formers for autoregressive keystroke prediction.
+
+    Reuses the same frontend (SpectrogramNorm + MultiBandMLP + ElectrodeMixer)
+    and encoder (TransformerBackbone + AttentionRefinementHead) as the CTC
+    model. Adds a Transformer decoder with cross-attention for autoregressive
+    character generation, trained with CrossEntropyLoss and teacher forcing.
+
+    Supports loading pretrained encoder weights from a CyRo2FormersCTCModule
+    checkpoint via ``pretrained_encoder_ckpt``.
+    """
+
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        # Electrode mixer
+        electrode_mixer_heads: int = 4,
+        electrode_mixer_dim: int = 384,
+        use_cyrope: bool = True,
+        # Encoder backbone
+        backbone_d_model: int = 768,
+        backbone_n_layers: int = 3,
+        transformer_n_heads: int = 8,
+        transformer_dim_feedforward: int = 2048,
+        transformer_dropout: float = 0.15,
+        # Attention refinement
+        use_attention_head: bool = True,
+        attn_n_layers: int = 2,
+        attn_n_heads: int = 8,
+        attn_dim_feedforward: int = 1024,
+        attn_dropout: float = 0.1,
+        # Decoder
+        decoder_n_layers: int = 2,
+        decoder_n_heads: int = 8,
+        decoder_dim_feedforward: int = 1024,
+        decoder_dropout: float = 0.15,
+        max_decode_length: int = 50,
+        label_smoothing: float = 0.1,
+        # Pretrained encoder
+        pretrained_encoder_ckpt: str | None = None,
+        encoder_lr_scale: float = 0.1,
+        # Training
+        optimizer: DictConfig = None,
+        lr_scheduler: DictConfig = None,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        freq_bins = in_features // self.ELECTRODE_CHANNELS
+
+        # ---- Frontend (shared with CTC) ----
+        self.spec_norm = SpectrogramNorm(
+            channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS
+        )
+        self.mlp_extractor = MultiBandRotationInvariantMLP(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            num_bands=self.NUM_BANDS,
+        )
+        self.attention_mixer = MultiBandElectrodeMixer(
+            in_features=freq_bins,
+            d_model=electrode_mixer_dim,
+            n_heads=electrode_mixer_heads,
+            n_electrodes=self.ELECTRODE_CHANNELS,
+            use_cyrope=use_cyrope,
+            num_bands=self.NUM_BANDS,
+        )
+        mlp_dim = mlp_features[-1]
+        combined_dim = self.NUM_BANDS * (mlp_dim + electrode_mixer_dim)
+        self.frontend_proj = (
+            nn.Linear(combined_dim, backbone_d_model)
+            if combined_dim != backbone_d_model
+            else nn.Identity()
+        )
+
+        # ---- Encoder (shared with CTC) ----
+        self.encoder = CyRo2FormersEncoder(
+            backbone_d_model=backbone_d_model,
+            backbone_n_layers=backbone_n_layers,
+            transformer_n_heads=transformer_n_heads,
+            transformer_dim_feedforward=transformer_dim_feedforward,
+            transformer_dropout=transformer_dropout,
+            use_attention_head=use_attention_head,
+            attn_n_layers=attn_n_layers,
+            attn_n_heads=attn_n_heads,
+            attn_dim_feedforward=attn_dim_feedforward,
+            attn_dropout=attn_dropout,
+            use_cyrope=use_cyrope,
+        )
+
+        # ---- Decoder (NEW) ----
+        self.decoder = TransformerDecoderModule(
+            num_classes=charset().num_classes_seq2seq,
+            d_model=backbone_d_model,
+            n_layers=decoder_n_layers,
+            n_heads=decoder_n_heads,
+            dim_feedforward=decoder_dim_feedforward,
+            dropout=decoder_dropout,
+        )
+        self.output_proj = nn.Linear(backbone_d_model, charset().num_classes_seq2seq)
+
+        self.max_decode_length = max_decode_length
+        self.encoder_lr_scale = encoder_lr_scale
+
+        # ---- Loss ----
+        self.ce_loss = nn.CrossEntropyLoss(
+            ignore_index=-1,
+            label_smoothing=label_smoothing,
+        )
+
+        # ---- Metrics ----
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
+        )
+
+        # ---- Load pretrained encoder ----
+        if pretrained_encoder_ckpt is not None:
+            self._load_pretrained_encoder(pretrained_encoder_ckpt)
+
+    def _load_pretrained_encoder(self, ckpt_path: str) -> None:
+        """Load encoder + frontend weights from a CyRo2FormersCTCModule ckpt."""
+        import logging
+        log = logging.getLogger(__name__)
+
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        src_state = state.get("state_dict", state)
+
+        # Map CTC module keys to this module's keys (same names for shared parts)
+        shared_prefixes = [
+            "spec_norm.", "mlp_extractor.", "attention_mixer.",
+            "frontend_proj.", "encoder.",
+        ]
+        loaded, skipped = 0, 0
+        own_state = self.state_dict()
+        for key, val in src_state.items():
+            if any(key.startswith(p) for p in shared_prefixes):
+                if key in own_state and own_state[key].shape == val.shape:
+                    own_state[key] = val
+                    loaded += 1
+                else:
+                    skipped += 1
+        self.load_state_dict(own_state, strict=False)
+        log.info(
+            f"Loaded {loaded} pretrained encoder params, skipped {skipped}"
+        )
+
+    def _encode(self, spectral_input: torch.Tensor) -> torch.Tensor:
+        """Run frontend + encoder. Returns (T', N, D)."""
+        x_norm = self.spec_norm(spectral_input)
+        x_mlp = self.mlp_extractor(x_norm)
+        x_attn = self.attention_mixer(x_norm)
+        x_combined = torch.cat([x_mlp, x_attn], dim=-1)
+        x_combined = x_combined.flatten(start_dim=2)
+        x_proj = self.frontend_proj(x_combined)
+        return self.encoder(x_proj)
+
+    def forward(
+        self,
+        spectral_input: torch.Tensor,
+        decoder_input: torch.Tensor,
+    ) -> torch.Tensor:
+        """Full forward pass for training (teacher forcing).
+
+        Args:
+            spectral_input: (T, N, bands, C, freq) raw spectrograms.
+            decoder_input: (S, N) integer token indices [sos, c1..cN].
+        Returns:
+            logits: (S, N, num_classes_seq2seq).
+        """
+        memory = self._encode(spectral_input)  # (T', N, D)
+        dec_out = self.decoder(decoder_input, memory)  # (S, N, D)
+        return self.output_proj(dec_out)  # (S, N, V)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        spectral_input: torch.Tensor,
+        max_length: int | None = None,
+        beam_width: int = 1,
+    ) -> list[list[int]]:
+        """Autoregressive decoding (greedy or beam search).
+
+        Args:
+            spectral_input: (T, N, bands, C, freq).
+            max_length: Maximum output length per sample.
+            beam_width: 1 for greedy, >1 for beam search.
+        Returns:
+            List of N token sequences (excluding sos, truncated at eos).
+        """
+        if max_length is None:
+            max_length = self.max_decode_length
+
+        memory = self._encode(spectral_input)  # (T', N, D)
+        N = memory.shape[1]
+
+        if beam_width <= 1:
+            return self._greedy_decode(memory, N, max_length)
+        return self._beam_decode(memory, N, max_length, beam_width)
+
+    def _greedy_decode(
+        self,
+        memory: torch.Tensor,
+        N: int,
+        max_length: int,
+    ) -> list[list[int]]:
+        device = memory.device
+        sos = charset().sos_class
+        eos = charset().eos_class
+
+        # Start with [sos] for each batch element
+        generated = torch.full((1, N), sos, dtype=torch.long, device=device)
+        finished = torch.zeros(N, dtype=torch.bool, device=device)
+
+        for _ in range(max_length):
+            dec_out = self.decoder(generated, memory)  # (cur_len, N, D)
+            logits = self.output_proj(dec_out[-1:])     # (1, N, V)
+            next_token = logits.argmax(dim=-1)          # (1, N)
+
+            # Mark finished sequences
+            finished = finished | (next_token.squeeze(0) == eos)
+            if finished.all():
+                break
+
+            generated = torch.cat([generated, next_token], dim=0)
+
+        # Extract token sequences, stripping sos and truncating at eos
+        results = []
+        for i in range(N):
+            tokens = generated[1:, i].tolist()  # skip sos
+            if eos in tokens:
+                tokens = tokens[:tokens.index(eos)]
+            results.append(tokens)
+        return results
+
+    def _beam_decode(
+        self,
+        memory: torch.Tensor,
+        N: int,
+        max_length: int,
+        beam_width: int,
+    ) -> list[list[int]]:
+        """Batch-parallel beam search decoding."""
+        device = memory.device
+        sos = charset().sos_class
+        eos = charset().eos_class
+        V = charset().num_classes_seq2seq
+
+        all_results = []
+        for i in range(N):
+            mem_i = memory[:, i:i+1, :]  # (T, 1, D)
+
+            # Each beam: (sequence_tensor, cumulative_log_prob)
+            beams = [(torch.tensor([[sos]], dtype=torch.long, device=device), 0.0)]
+            finished_beams: list[tuple[list[int], float]] = []
+
+            for _ in range(max_length):
+                candidates: list[tuple[torch.Tensor, float]] = []
+                for seq, score in beams:
+                    # seq: (cur_len, 1)
+                    dec_out = self.decoder(seq, mem_i)
+                    logits = self.output_proj(dec_out[-1, 0])  # (V,)
+                    log_probs = torch.log_softmax(logits, dim=-1)
+
+                    topk_lp, topk_idx = log_probs.topk(beam_width)
+                    for lp, idx in zip(topk_lp.tolist(), topk_idx.tolist()):
+                        new_token = torch.tensor(
+                            [[idx]], dtype=torch.long, device=device
+                        )
+                        new_seq = torch.cat([seq, new_token], dim=0)
+                        candidates.append((new_seq, score + lp))
+
+                # Prune to top beam_width
+                candidates.sort(key=lambda c: c[1], reverse=True)
+                beams = []
+                for seq, score in candidates[:beam_width]:
+                    last_token = seq[-1, 0].item()
+                    if last_token == eos:
+                        tokens = seq[1:-1, 0].tolist()  # strip sos and eos
+                        finished_beams.append((tokens, score))
+                    else:
+                        beams.append((seq, score))
+
+                if not beams:
+                    break
+
+            # Add unfinished beams
+            for seq, score in beams:
+                tokens = seq[1:, 0].tolist()
+                finished_beams.append((tokens, score))
+
+            # Pick best
+            finished_beams.sort(key=lambda b: b[1], reverse=True)
+            all_results.append(finished_beams[0][0] if finished_beams else [])
+
+        return all_results
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        decoder_input = batch["decoder_input"]   # (S, N) [sos, c1..cN]
+        decoder_target = batch["decoder_target"] # (S, N) [c1..cN, eos]
+        target_lengths = batch["target_lengths"]
+        targets = batch["targets"]               # (T_target, N) for metrics
+        N = len(target_lengths)
+
+        # Teacher-forcing forward pass
+        logits = self.forward(inputs, decoder_input)  # (S, N, V)
+
+        # CE loss: flatten (S*N, V) vs (S*N,)
+        S, _, V = logits.shape
+        loss = self.ce_loss(
+            logits.reshape(S * N, V),
+            decoder_target.reshape(S * N),
+        )
+
+        # Decode for metrics (greedy from logits, no autoregressive)
+        preds = logits.argmax(dim=-1)  # (S, N)
+
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets_np = targets.detach().cpu().numpy()
+        target_lengths_np = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            # Extract predicted tokens, strip eos and padding
+            pred_tokens = preds[:, i].tolist()
+            eos_val = charset().eos_class
+            if eos_val in pred_tokens:
+                pred_tokens = pred_tokens[:pred_tokens.index(eos_val)]
+            # Filter to valid character range only
+            pred_tokens = [t for t in pred_tokens if t < charset().num_classes - 1]
+
+            prediction = LabelData.from_labels(pred_tokens)
+            target = LabelData.from_labels(
+                targets_np[:target_lengths_np[i], i]
+            )
+            metrics.update(prediction=prediction, target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        opt_cfg = self.hparams.optimizer
+        assert opt_cfg is not None
+
+        # Differential LR: encoder at encoder_lr_scale * base_lr
+        encoder_params = set()
+        for module in [
+            self.spec_norm, self.mlp_extractor, self.attention_mixer,
+            self.frontend_proj, self.encoder,
+        ]:
+            encoder_params.update(module.parameters())
+
+        encoder_group = [p for p in encoder_params if p.requires_grad]
+        decoder_group = [
+            p for p in self.parameters()
+            if p not in encoder_params and p.requires_grad
+        ]
+
+        param_groups = [
+            {"params": encoder_group, "lr": opt_cfg.lr * self.encoder_lr_scale},
+            {"params": decoder_group, "lr": opt_cfg.lr},
+        ]
+
+        import hydra
+        import omegaconf
+        optimizer = hydra.utils.instantiate(opt_cfg, param_groups)
+        scheduler = hydra.utils.instantiate(
+            self.hparams.lr_scheduler.scheduler, optimizer
+        )
+        lr_scheduler = hydra.utils.instantiate(
+            self.hparams.lr_scheduler, scheduler=scheduler
+        )
         return {
             "optimizer": optimizer,
             "lr_scheduler": omegaconf.OmegaConf.to_container(lr_scheduler),

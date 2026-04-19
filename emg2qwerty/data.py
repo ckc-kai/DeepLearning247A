@@ -565,3 +565,72 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
             "input_lengths": input_lengths,
             "target_lengths": target_lengths,
         }
+
+    @staticmethod
+    def collate_seq2seq(
+        samples: Sequence[tuple[torch.Tensor | dict[str, torch.Tensor], torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        """Collate for encoder-decoder training with teacher forcing.
+
+        Produces decoder_input = [sos, c1, ..., cN] and
+        decoder_target = [c1, ..., cN, eos] for each sample, padded
+        to the longest target in the batch.
+
+        Returns the same keys as ``collate`` plus ``decoder_input``,
+        ``decoder_target``, and ``decoder_lengths``.
+        """
+        from emg2qwerty.charset import charset as get_charset
+        cs = get_charset()
+
+        inputs = [sample[0] for sample in samples]
+        targets = [sample[1] for sample in samples]
+
+        # Standard input batching (same as collate)
+        if isinstance(inputs[0], dict):
+            input_batch = nn.utils.rnn.pad_sequence(
+                [inp["spectral"] for inp in inputs]
+            )
+        else:
+            input_batch = nn.utils.rnn.pad_sequence(inputs)
+
+        input_lengths = torch.as_tensor(
+            [len(inp["spectral"] if isinstance(inp, dict) else inp) for inp in inputs],
+            dtype=torch.int32,
+        )
+
+        # CTC-style target batching (for metrics compatibility)
+        target_batch = nn.utils.rnn.pad_sequence(targets)
+        target_lengths = torch.as_tensor(
+            [len(t) for t in targets], dtype=torch.int32
+        )
+
+        # Build teacher-forcing decoder sequences
+        sos = torch.tensor([cs.sos_class], dtype=torch.long)
+        eos = torch.tensor([cs.eos_class], dtype=torch.long)
+        dec_inputs = []
+        dec_targets = []
+        for t in targets:
+            dec_inputs.append(torch.cat([sos, t]))          # [sos, c1..cN]
+            dec_targets.append(torch.cat([t, eos]))          # [c1..cN, eos]
+
+        # Pad decoder sequences: (S, N) time-first
+        # Pad with eos_class so padded positions don't contribute to loss
+        decoder_input = nn.utils.rnn.pad_sequence(
+            dec_inputs, padding_value=cs.eos_class,
+        )
+        decoder_target = nn.utils.rnn.pad_sequence(
+            dec_targets, padding_value=-1,  # ignore_index for CE loss
+        )
+        decoder_lengths = torch.as_tensor(
+            [len(di) for di in dec_inputs], dtype=torch.int32
+        )
+
+        return {
+            "inputs": input_batch,
+            "targets": target_batch,
+            "input_lengths": input_lengths,
+            "target_lengths": target_lengths,
+            "decoder_input": decoder_input,
+            "decoder_target": decoder_target,
+            "decoder_lengths": decoder_lengths,
+        }

@@ -532,6 +532,57 @@ def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torc
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
+class TemporalRoPE(nn.Module):
+    """1D Rotary Positional Embedding for temporal sequences.
+
+    Unlike CyRoPE which handles 2D (time x electrode), this only encodes
+    the time axis. Used in backbone and refinement head where electrodes
+    are already mixed.
+
+    Args:
+        head_dim (int): Per-head dimension (must be even).
+        max_time (int): Maximum temporal length to pre-compute (default: 4096).
+        base_freq (float): Base for geometric frequency progression (default: 10000).
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_time: int = 4096,
+        base_freq: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+        self.base_freq = base_freq
+        self.head_dim = head_dim
+        half = head_dim // 2
+
+        freq = 1.0 / (
+            base_freq ** (torch.arange(0, half, dtype=torch.float32) / half)
+        )
+        t_pos = torch.arange(max_time, dtype=torch.float32)
+        theta = torch.outer(t_pos, freq)  # (max_time, half)
+
+        self.register_buffer("cos_cache", theta.cos(), persistent=False)
+        self.register_buffer("sin_cache", theta.sin(), persistent=False)
+
+    def forward(self, T: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (cos, sin) each of shape (T, head_dim // 2)."""
+        if T <= self.cos_cache.shape[0]:
+            return self.cos_cache[:T], self.sin_cache[:T]
+
+        # Dynamic extension for sequences exceeding pre-computed length
+        half = self.head_dim // 2
+        device = self.cos_cache.device
+        freq = 1.0 / (
+            self.base_freq
+            ** (torch.arange(0, half, dtype=torch.float32, device=device) / half)
+        )
+        t_pos = torch.arange(T, dtype=torch.float32, device=device)
+        theta = torch.outer(t_pos, freq)
+        return theta.cos(), theta.sin()
+
+
 class ElectrodeMixerAttention(nn.Module):
     """Multi-head attention over the **electrode** dimension for a single band.
 
@@ -682,16 +733,118 @@ class MultiBandElectrodeMixer(nn.Module):
         return torch.stack(outputs, dim=2)
 
 
+class RoPETransformerEncoderLayer(nn.Module):
+    """Pre-LN Transformer encoder layer with Rotary Positional Embedding
+    applied to Q and K before scaled dot-product attention.
+
+    Equivalent to nn.TransformerEncoderLayer(norm_first=True) but injects
+    RoPE into Q/K instead of using additive positional encoding.
+
+    Args:
+        d_model (int): Model dimension.
+        nhead (int): Number of attention heads.
+        dim_feedforward (int): FFN hidden dimension.
+        dropout (float): Dropout rate.
+        activation (str): Activation function ("gelu" or "relu").
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+        assert d_model % nhead == 0
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+
+        # Self-attention projections
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.activation = nn.GELU() if activation == "gelu" else nn.ReLU()
+
+        # Pre-LN norms
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # Dropout
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (T, N, D) input sequence.
+            cos: (T, head_dim // 2) cosine components from TemporalRoPE.
+            sin: (T, head_dim // 2) sine components from TemporalRoPE.
+        """
+        x = x + self._sa_block(self.norm1(x), cos, sin)
+        x = x + self._ff_block(self.norm2(x))
+        return x
+
+    def _sa_block(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        T, N, D = x.shape
+
+        q = self.q_proj(x).view(T, N, self.nhead, self.head_dim)
+        k = self.k_proj(x).view(T, N, self.nhead, self.head_dim)
+        v = self.v_proj(x).view(T, N, self.nhead, self.head_dim)
+
+        # Apply RoPE to Q and K: (T, 1, 1, half) broadcasts over (N, nhead)
+        cos_ = cos.unsqueeze(1).unsqueeze(2)
+        sin_ = sin.unsqueeze(1).unsqueeze(2)
+        q = _apply_rotary(q, cos_, sin_)
+        k = _apply_rotary(k, cos_, sin_)
+
+        # Reshape for batched matmul: (N * nhead, T, head_dim)
+        q = q.permute(1, 2, 0, 3).reshape(N * self.nhead, T, self.head_dim)
+        k = k.permute(1, 2, 0, 3).reshape(N * self.nhead, T, self.head_dim)
+        v = v.permute(1, 2, 0, 3).reshape(N * self.nhead, T, self.head_dim)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)  # (N * nhead, T, head_dim)
+
+        out = out.reshape(N, self.nhead, T, self.head_dim)
+        out = out.permute(2, 0, 1, 3).reshape(T, N, D)
+        return self.dropout1(self.out_proj(out))
+
+    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout3(
+            self.linear2(self.dropout2(self.activation(self.linear1(x))))
+        )
+
+
 # ---------------------------------------------------------------------------
 # Attention Refinement Head
 # ---------------------------------------------------------------------------
 
 
 class AttentionRefinementHead(nn.Module):
-    """Small Transformer encoder for CTC-alignment refinement.
+    """Small Transformer encoder with RoPE for temporal refinement.
 
-    Optionally injects CyRoPE along the time axis only (electrodes already
-    mixed at this point).
+    Applies additional self-attention layers with RoPE on the time axis
+    after the main backbone to refine temporal representations.
 
     Args:
         d_model (int): Input/output dimension.
@@ -699,8 +852,8 @@ class AttentionRefinementHead(nn.Module):
         n_heads (int): Number of attention heads.
         dim_feedforward (int): FFN hidden dimension.
         dropout (float): Dropout rate.
-        use_cyrope (bool): Whether to inject CyRoPE on the time axis.
-        max_time (int): Maximum time length for positional encoding.
+        use_cyrope (bool): Kept for config compatibility (always uses RoPE).
+        max_time (int): Kept for config compatibility (handled by TemporalRoPE).
     """
 
     def __init__(
@@ -714,77 +867,29 @@ class AttentionRefinementHead(nn.Module):
         max_time: int = 2048,
     ) -> None:
         super().__init__()
-        self.use_cyrope = use_cyrope
         self.d_model = d_model
+        head_dim = d_model // n_heads
 
-        if use_cyrope:
-            # Time-only CyRoPE: use d_model-sized positional encoding
-            # We need d_model divisible by 4 for CyRoPE; pad/truncate if needed
-            self.rope_dim = (d_model // 4) * 4
-            if self.rope_dim > 0:
-                self._build_time_rope(max_time)
-        else:
-            # Standard sinusoidal positional encoding
-            self._build_standard_pe(max_time)
+        self.rope = TemporalRoPE(head_dim=head_dim)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=False,  # expects (T, N, D)
-            norm_first=True,    # Pre-LN
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-    def _build_time_rope(self, max_time: int, device: Optional[torch.device] = None) -> None:
-        """Build sinusoidal positional encoding (time-only, no electrode axis)."""
-        d = self.rope_dim
-        pos = torch.arange(max_time, dtype=torch.float32, device=device).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d, 2, dtype=torch.float32, device=device) * -(math.log(10000.0) / d)
-        )
-        pe = torch.zeros(max_time, d, device=device)
-        pe[:, 0::2] = torch.sin(pos * div_term)
-        pe[:, 1::2] = torch.cos(pos * div_term)
-        self.register_buffer("time_pe", pe, persistent=False)  # (max_time, d)
-
-    def _build_standard_pe(self, max_time: int, device: Optional[torch.device] = None) -> None:
-        """Build full d_model sinusoidal PE when CyRoPE isn't used."""
-        pos = torch.arange(max_time, dtype=torch.float32, device=device).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, self.d_model, 2, dtype=torch.float32, device=device) * -(math.log(10000.0) / self.d_model)
-        )
-        pe = torch.zeros(max_time, 1, self.d_model, device=device)
-        pe[:, 0, 0::2] = torch.sin(pos * div_term)
-        pe[:, 0, 1::2] = torch.cos(pos * div_term)
-        self.register_buffer("pos_embed", pe, persistent=False)
+        self.layers = nn.ModuleList([
+            RoPETransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation="gelu",
+            )
+            for _ in range(n_layers)
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (T, N, D) → (T, N, D)"""
         T = x.shape[0]
-
-        if self.use_cyrope and self.rope_dim > 0:
-            if T > self.time_pe.shape[0]:
-                self._build_time_rope(T, device=x.device)
-                
-            # Add sinusoidal time positional encoding
-            pe = self.time_pe[:T].unsqueeze(1)  # (T, 1, rope_dim)
-            if self.rope_dim < self.d_model:
-                # Pad with zeros for remaining dims
-                padding = torch.zeros(
-                    T, 1, self.d_model - self.rope_dim,
-                    device=x.device, dtype=x.dtype,
-                )
-                pe = torch.cat([pe, padding], dim=-1)
-            x = x + pe
-        elif not self.use_cyrope:
-            if T > self.pos_embed.shape[0]:
-                self._build_standard_pe(T, device=x.device)
-            x = x + self.pos_embed[:T]
-
-        return self.encoder(x)
+        cos, sin = self.rope(T)
+        for layer in self.layers:
+            x = layer(x, cos, sin)
+        return x
 
 
 
@@ -794,9 +899,11 @@ class AttentionRefinementHead(nn.Module):
 
 
 class TransformerBackbone(nn.Module):
-    """Transformer encoder backbone for temporal modeling.
+    """Transformer encoder backbone with RoPE for temporal modeling.
 
-    Operates on (T, N, D). Caller should ensure this shape.
+    Operates on (T, N, D). Uses Rotary Positional Embedding applied to
+    Q/K in each attention layer for positional encoding consistency with
+    the CyRoPE-based ElectrodeMixer frontend.
 
     Args:
         d_model (int): Model dimension.
@@ -816,40 +923,265 @@ class TransformerBackbone(nn.Module):
     ) -> None:
         super().__init__()
         self.d_model = d_model
-        
-        # Precompute initial sinusoidal positional encodings
-        self.max_time = 4096
-        self._build_pe(self.max_time)
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=False,  # expects (T, N, D)
-            norm_first=True,    # Pre-LN
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        head_dim = d_model // n_heads
 
-    def _build_pe(self, max_time: int, device: Optional[torch.device] = None) -> None:
-        pos = torch.arange(max_time, dtype=torch.float32, device=device).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, self.d_model, 2, dtype=torch.float32, device=device) * -(math.log(10000.0) / self.d_model)
-        )
-        pe = torch.zeros(max_time, 1, self.d_model, device=device)
-        pe[:, 0, 0::2] = torch.sin(pos * div_term)
-        pe[:, 0, 1::2] = torch.cos(pos * div_term)
-        self.register_buffer("pos_embed", pe, persistent=False)
+        self.rope = TemporalRoPE(head_dim=head_dim)
+
+        self.layers = nn.ModuleList([
+            RoPETransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation="gelu",
+            )
+            for _ in range(n_layers)
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (T, N, D) → (T, N, D)"""
         T = x.shape[0]
-        if T > self.pos_embed.shape[0]:
-            self._build_pe(T, device=x.device)
-            
-        x = x + self.pos_embed[:T]
-        return self.encoder(x)
+        cos, sin = self.rope(T)
+        for layer in self.layers:
+            x = layer(x, cos, sin)
+        return x
+
+
+class RoPETransformerDecoderLayer(nn.Module):
+    """Pre-LN Transformer decoder layer with RoPE in causal self-attention
+    and standard cross-attention to encoder memory.
+
+    RoPE is applied to Q/K in the masked self-attention sublayer.
+    Cross-attention uses standard projections (encoder positions are
+    already encoded by the encoder's own RoPE).
+
+    Args:
+        d_model (int): Model dimension.
+        nhead (int): Number of attention heads.
+        dim_feedforward (int): FFN hidden dimension.
+        dropout (float): Dropout rate.
+        activation (str): Activation function ("gelu" or "relu").
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+        assert d_model % nhead == 0
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+
+        # Causal self-attention projections
+        self.self_q_proj = nn.Linear(d_model, d_model)
+        self.self_k_proj = nn.Linear(d_model, d_model)
+        self.self_v_proj = nn.Linear(d_model, d_model)
+        self.self_out_proj = nn.Linear(d_model, d_model)
+
+        # Cross-attention projections
+        self.cross_q_proj = nn.Linear(d_model, d_model)
+        self.cross_k_proj = nn.Linear(d_model, d_model)
+        self.cross_v_proj = nn.Linear(d_model, d_model)
+        self.cross_out_proj = nn.Linear(d_model, d_model)
+
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.activation = nn.GELU() if activation == "gelu" else nn.ReLU()
+
+        # Pre-LN norms
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        # Dropout
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.dropout4 = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        tgt_mask: torch.Tensor | None = None,
+        memory_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            tgt: (S, N, D) decoder input.
+            memory: (T, N, D) encoder output.
+            cos: (S, head_dim // 2) RoPE cosines for decoder positions.
+            sin: (S, head_dim // 2) RoPE sines for decoder positions.
+            tgt_mask: (S, S) causal mask (additive, -inf for masked positions).
+            memory_key_padding_mask: (N, T) bool mask for encoder padding.
+        """
+        tgt = tgt + self._sa_block(self.norm1(tgt), cos, sin, tgt_mask)
+        tgt = tgt + self._ca_block(self.norm2(tgt), memory, memory_key_padding_mask)
+        tgt = tgt + self._ff_block(self.norm3(tgt))
+        return tgt
+
+    def _sa_block(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Causal self-attention with RoPE."""
+        S, N, D = x.shape
+
+        q = self.self_q_proj(x).view(S, N, self.nhead, self.head_dim)
+        k = self.self_k_proj(x).view(S, N, self.nhead, self.head_dim)
+        v = self.self_v_proj(x).view(S, N, self.nhead, self.head_dim)
+
+        cos_ = cos.unsqueeze(1).unsqueeze(2)
+        sin_ = sin.unsqueeze(1).unsqueeze(2)
+        q = _apply_rotary(q, cos_, sin_)
+        k = _apply_rotary(k, cos_, sin_)
+
+        q = q.permute(1, 2, 0, 3).reshape(N * self.nhead, S, self.head_dim)
+        k = k.permute(1, 2, 0, 3).reshape(N * self.nhead, S, self.head_dim)
+        v = v.permute(1, 2, 0, 3).reshape(N * self.nhead, S, self.head_dim)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if attn_mask is not None:
+            attn = attn + attn_mask.unsqueeze(0)  # broadcast over N*nhead
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = out.reshape(N, self.nhead, S, self.head_dim)
+        out = out.permute(2, 0, 1, 3).reshape(S, N, D)
+        return self.dropout1(self.self_out_proj(out))
+
+    def _ca_block(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+        memory_key_padding_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Cross-attention to encoder output (no RoPE)."""
+        S, N, D = x.shape
+        T = memory.shape[0]
+
+        q = self.cross_q_proj(x).view(S, N, self.nhead, self.head_dim)
+        k = self.cross_k_proj(memory).view(T, N, self.nhead, self.head_dim)
+        v = self.cross_v_proj(memory).view(T, N, self.nhead, self.head_dim)
+
+        q = q.permute(1, 2, 0, 3).reshape(N * self.nhead, S, self.head_dim)
+        k = k.permute(1, 2, 0, 3).reshape(N * self.nhead, T, self.head_dim)
+        v = v.permute(1, 2, 0, 3).reshape(N * self.nhead, T, self.head_dim)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if memory_key_padding_mask is not None:
+            # (N, T) -> (N, 1, 1, T) -> (N*nhead, 1, T)
+            mask = memory_key_padding_mask.unsqueeze(1).unsqueeze(2)
+            mask = mask.expand(-1, self.nhead, -1, -1).reshape(N * self.nhead, 1, T)
+            attn = attn.masked_fill(mask, float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = out.reshape(N, self.nhead, S, self.head_dim)
+        out = out.permute(2, 0, 1, 3).reshape(S, N, D)
+        return self.dropout2(self.cross_out_proj(out))
+
+    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout4(
+            self.linear2(self.dropout3(self.activation(self.linear1(x))))
+        )
+
+
+class TransformerDecoderModule(nn.Module):
+    """Autoregressive Transformer decoder with RoPE for the seq2seq model.
+
+    Token embeddings + RoPE self-attention + cross-attention to encoder output.
+
+    Args:
+        num_classes (int): Vocabulary size (including sos, eos, blank).
+        d_model (int): Model dimension.
+        n_layers (int): Number of decoder layers.
+        n_heads (int): Number of attention heads.
+        dim_feedforward (int): FFN hidden dimension.
+        dropout (float): Dropout rate.
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        d_model: int = 768,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.15,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_classes = num_classes
+        head_dim = d_model // n_heads
+
+        self.token_embedding = nn.Embedding(num_classes, d_model)
+        self.embed_scale = math.sqrt(d_model)
+        self.embed_dropout = nn.Dropout(dropout)
+
+        self.rope = TemporalRoPE(head_dim=head_dim)
+
+        self.layers = nn.ModuleList([
+            RoPETransformerDecoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation="gelu",
+            )
+            for _ in range(n_layers)
+        ])
+
+        self.final_norm = nn.LayerNorm(d_model)
+
+    @staticmethod
+    def generate_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+        """Generate additive causal mask: 0 for allowed, -inf for masked."""
+        mask = torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=device),
+            diagonal=1,
+        )
+        return mask
+
+    def forward(
+        self,
+        tgt_tokens: torch.Tensor,
+        memory: torch.Tensor,
+        memory_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            tgt_tokens: (S, N) integer token indices.
+            memory: (T, N, D) encoder output.
+            memory_key_padding_mask: (N, T) bool mask for encoder padding.
+        Returns:
+            (S, N, D) decoder hidden states (no logit projection).
+        """
+        S, N = tgt_tokens.shape
+        device = tgt_tokens.device
+
+        # Token embedding + RoPE
+        x = self.token_embedding(tgt_tokens) * self.embed_scale  # (S, N, D)
+        x = self.embed_dropout(x)
+
+        cos, sin = self.rope(S)
+        causal_mask = self.generate_causal_mask(S, device)
+
+        for layer in self.layers:
+            x = layer(x, memory, cos, sin, causal_mask, memory_key_padding_mask)
+
+        return self.final_norm(x)
 
 
 class CyRo2FormersEncoder(nn.Module):
